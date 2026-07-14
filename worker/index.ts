@@ -8,8 +8,8 @@ interface Env {
   EMAIL_FROM?: string;
   AUTH_SECRET?: string;
   ADMIN_EMAILS?: string;
-  OPENAI_API_KEY?: string;
-  OPENAI_MODEL?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_MODEL?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -406,7 +406,7 @@ async function parseProfileWithAi(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (auth.response || !auth.user) return auth.response!;
   if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
-  if (!env.OPENAI_API_KEY) return json({ error: "AI 解析服务尚未配置，请联系管理员添加 OpenAI API Key" }, 503);
+  if (!env.GEMINI_API_KEY) return json({ error: "AI 解析服务尚未配置，请联系管理员添加 Gemini API Key" }, 503);
   const body = await requestBody(request);
   const type = body?.type === "role" || body?.type === "talent" ? body.type as "role" | "talent" : null;
   const sourceText = typeof body?.text === "string" ? body.text.trim() : "";
@@ -425,36 +425,35 @@ async function parseProfileWithAi(request: Request, env: Env) {
 
   const fields = PROFILE_FIELDS[type];
   const properties = Object.fromEntries(fields.map((field) => [field, { type: "string" }]));
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
-    headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, "content-type": "application/json" },
+    headers: { "x-goog-api-key": env.GEMINI_API_KEY, "content-type": "application/json" },
     body: JSON.stringify({
-      model: env.OPENAI_MODEL || "gpt-5-mini",
-      store: false,
-      instructions: `你是职业信息结构化分析器。把用户提供的${type === "role" ? "岗位/JD/招聘信息" : "求职经历/能力/偏好"}按字段语义归类。必须遵守：1. 不按句子出现顺序机械分配；2. 同一字段可整合多处信息并保留数字、币种、比例、期限和限定条件；3. 不得编造原文没有的信息；4. 无法判断的字段返回空字符串；5. 不要把职责放进职位名称，也不要把要求放进工作内容；6. 输出简体中文，专有名词可保留原文。`,
-      input: `字段说明：${fields.join(", ")}\n已有字段（仅用于补齐，不要覆盖其明确事实）：${JSON.stringify(existing)}\n待解析原文：\n${sourceText}`,
-      text: {
-        format: {
-          type: "json_schema",
-          name: `${type}_profile`,
-          strict: true,
-          schema: { type: "object", properties, required: [...fields], additionalProperties: false },
-        },
+      systemInstruction: {
+        parts: [{ text: `你是职业信息结构化分析器。把用户提供的${type === "role" ? "岗位/JD/招聘信息" : "求职经历/能力/偏好"}按字段语义归类。必须遵守：1. 不按句子出现顺序机械分配；2. 同一字段可整合多处信息并保留数字、币种、比例、期限和限定条件；3. 不得编造原文没有的信息；4. 无法判断的字段返回空字符串；5. 不要把职责放进职位名称，也不要把要求放进工作内容；6. 输出简体中文，专有名词可保留原文。` }],
       },
-      max_output_tokens: 4000,
+      contents: [{ role: "user", parts: [{ text: `字段说明：${fields.join(", ")}\n已有字段（仅用于补齐，不要覆盖其明确事实）：${JSON.stringify(existing)}\n待解析原文：\n${sourceText}` }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseJsonSchema: { type: "object", properties, required: [...fields], additionalProperties: false },
+        temperature: 0.1,
+        maxOutputTokens: 4000,
+      },
     }),
   });
   const result = await response.json() as Record<string, unknown>;
   if (!response.ok) {
-    console.error("OpenAI parse error", response.status, JSON.stringify(result).slice(0, 800));
+    console.error("Gemini parse error", response.status, JSON.stringify(result).slice(0, 800));
     return json({ error: "AI 暂时无法解析，请稍后重试" }, 502);
   }
-  let outputText = typeof result.output_text === "string" ? result.output_text : "";
-  if (!outputText && Array.isArray(result.output)) {
-    for (const item of result.output as Array<Record<string, unknown>>) {
-      if (!Array.isArray(item.content)) continue;
-      for (const content of item.content as Array<Record<string, unknown>>) {
-        if (content.type === "output_text" && typeof content.text === "string") outputText += content.text;
+  let outputText = "";
+  if (Array.isArray(result.candidates)) {
+    for (const candidate of result.candidates as Array<Record<string, unknown>>) {
+      const content = candidate.content as Record<string, unknown> | undefined;
+      if (!content || !Array.isArray(content.parts)) continue;
+      for (const part of content.parts as Array<Record<string, unknown>>) {
+        if (typeof part.text === "string") outputText += part.text;
       }
     }
   }
