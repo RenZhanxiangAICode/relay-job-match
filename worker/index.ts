@@ -425,7 +425,7 @@ async function parseProfileWithAi(request: Request, env: Env) {
 
   const fields = PROFILE_FIELDS[type];
   const properties = Object.fromEntries(fields.map((field) => [field, { type: "string" }]));
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const model = env.GEMINI_MODEL || "gemini-flash-latest";
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
     headers: { "x-goog-api-key": env.GEMINI_API_KEY, "content-type": "application/json" },
