@@ -59,3 +59,22 @@ test("keeps real email auth and persistent profiles wired", async () => {
   assert.match(envExample, /RESEND_API_KEY=/);
   assert.match(envExample, /AUTH_SECRET=/);
 });
+
+test("uses indexed incremental matching and per-direction monthly limits", async () => {
+  const [worker, schema, page] = await Promise.all([
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(worker, /JOIN profile_keywords other ON other\.keyword = mine\.keyword/);
+  assert.match(worker, /LIMIT 100/);
+  assert.match(worker, /if \(keywordScore < 90\) continue/);
+  assert.match(worker, /cosine\(ownVector, candidateVector\)/);
+  assert.match(worker, /match_runs/);
+  assert.match(worker, /publication_cycles/);
+  assert.match(schema, /profileKeywords/);
+  assert.match(schema, /publicationCycles/);
+  assert.match(page, /暂停入池/);
+  assert.match(page, /本月已删除过/);
+});

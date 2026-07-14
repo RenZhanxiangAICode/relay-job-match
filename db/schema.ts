@@ -31,15 +31,54 @@ export const profiles = sqliteTable("profiles", {
   type: text("type", { enum: ["role", "talent"] }).notNull(),
   anonymousCode: text("anonymous_code").notNull(),
   payload: text("payload", { mode: "json" }).$type<Record<string, unknown>>().notNull(),
+  searchText: text("search_text").notNull().default(""),
+  embedding: text("embedding", { mode: "json" }).$type<number[]>().notNull().default("[]"),
+  contentVersion: integer("content_version").notNull().default(1),
+  lastMatchedWeek: text("last_matched_week"),
   completion: integer("completion").notNull().default(0),
   status: text("status", { enum: ["draft", "pooled", "paused", "removed"] }).notNull().default("draft"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  deletedAt: integer("deleted_at", { mode: "timestamp" }),
 }, (table) => [
   uniqueIndex("profiles_user_type_unique").on(table.userId, table.type),
   uniqueIndex("profiles_anonymous_code_unique").on(table.anonymousCode),
   index("profiles_pool_idx").on(table.type, table.status),
 ]);
+
+export const profileKeywords = sqliteTable("profile_keywords", {
+  profileId: text("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  keyword: text("keyword").notNull(),
+  type: text("type", { enum: ["role", "talent"] }).notNull(),
+  weight: integer("weight").notNull().default(1),
+}, (table) => [
+  primaryKey({ columns: [table.profileId, table.keyword] }),
+  index("profile_keywords_lookup_idx").on(table.type, table.keyword),
+]);
+
+export const publicationCycles = sqliteTable("publication_cycles", {
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  type: text("type", { enum: ["role", "talent"] }).notNull(),
+  monthKey: text("month_key").notNull(),
+  deleteCount: integer("delete_count").notNull().default(0),
+  recreateCount: integer("recreate_count").notNull().default(0),
+}, (table) => [primaryKey({ columns: [table.userId, table.type, table.monthKey] })]);
+
+export const matchRuns = sqliteTable("match_runs", {
+  profileId: text("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  weekKey: text("week_key").notNull(),
+  contentVersion: integer("content_version").notNull(),
+  candidateCount: integer("candidate_count").notNull().default(0),
+  matchedCount: integer("matched_count").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [primaryKey({ columns: [table.profileId, table.weekKey] })]);
+
+export const matchExclusions = sqliteTable("match_exclusions", {
+  roleProfileId: text("role_profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  talentProfileId: text("talent_profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  reason: text("reason", { enum: ["hidden", "cancelled", "reported"] }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [primaryKey({ columns: [table.roleProfileId, table.talentProfileId] })]);
 
 export const matches = sqliteTable("matches", {
   id: text("id").primaryKey(),

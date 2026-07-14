@@ -60,29 +60,68 @@ function weekKey(date = new Date()) {
   return `${utc.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
 }
 
-function words(value: unknown) {
-  return String(value ?? "").toLowerCase().split(/[\s,，。；;、/|·\-]+/).filter((item) => item.length > 1);
+function monthKey(date = new Date()) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-function overlap(a: unknown, b: unknown) {
-  const left = new Set(words(a));
-  return words(b).filter((item) => left.has(item)).length;
+function tokenize(value: unknown) {
+  const text = String(value ?? "").toLowerCase().normalize("NFKC");
+  const tokens = text.match(/[a-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}/g) ?? [];
+  const result: string[] = [];
+  for (const token of tokens) {
+    if (/^[\u3400-\u9fff]+$/.test(token)) {
+      if (token.length <= 4) result.push(token);
+      for (let index = 0; index < token.length - 1; index += 1) result.push(token.slice(index, index + 2));
+    } else {
+      result.push(token);
+    }
+  }
+  return result;
 }
 
-function scorePair(role: Record<string, unknown>, talent: Record<string, unknown>) {
-  let score = 72;
-  const reasons: string[] = [];
-  const cityHits = overlap(role.city, talent.city);
-  const industryHits = overlap(role.industry, talent.industry);
-  const abilityHits = overlap(`${role.ability} ${role.knowledge}`, `${talent.ability} ${talent.credential}`);
-  if (cityHits) { score += 8; reasons.push("城市与工作方式偏好有交集"); }
-  if (industryHits) { score += 7; reasons.push("行业兴趣与岗位背景相符"); }
-  if (abilityHits) { score += Math.min(12, abilityHits * 4); reasons.push("能力与岗位要求存在可验证交集"); }
-  if (overlap(role.system, talent.salary)) { score += 5; reasons.push("薪酬期望存在交集"); }
+function buildProfileIndex(payload: Record<string, unknown>) {
+  const important = new Set(["city", "role", "industry", "ability", "knowledge", "credential", "salary", "system"]);
+  const weighted = new Map<string, number>();
+  for (const [key, value] of Object.entries(payload)) {
+    for (const token of tokenize(value)) weighted.set(token, Math.max(weighted.get(token) ?? 0, important.has(key) ? 3 : 1));
+  }
+  const searchText = Object.values(payload).map((value) => String(value ?? "").trim()).filter(Boolean).join("\n").slice(0, 12000);
+  return { searchText, keywords: [...weighted.entries()].slice(0, 300) };
+}
+
+function hashToken(token: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < token.length; index += 1) hash = Math.imul(hash ^ token.charCodeAt(index), 16777619);
+  return hash >>> 0;
+}
+
+function vectorize(searchText: string, size = 128) {
+  const vector = Array.from({ length: size }, () => 0);
+  for (const token of tokenize(searchText)) {
+    const hash = hashToken(token);
+    vector[hash % size] += (hash & 1) === 0 ? 1 : -1;
+  }
+  const length = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => Math.round((value / length) * 100000) / 100000);
+}
+
+function cosine(left: number[], right: number[]) {
+  if (!left.length || left.length !== right.length) return 0;
+  let dot = 0;
+  let leftLength = 0;
+  let rightLength = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    dot += left[index] * right[index];
+    leftLength += left[index] ** 2;
+    rightLength += right[index] ** 2;
+  }
+  return dot / ((Math.sqrt(leftLength) * Math.sqrt(rightLength)) || 1);
+}
+
+function describeMatch(keywordScore: number, vectorScore: number) {
   return {
-    score: Math.min(98, score),
-    reasons: reasons.length ? reasons : ["基础条件存在一定交集，仍需更多资料验证"],
-    risks: ["岗位、任职、HC、薪酬和经历均为用户自述，平台第一版不作第三方认证"],
+    reasons: [`关键词匹配 ${keywordScore} 分`, `向量相似度 ${vectorScore} 分`],
+    risks: ["岗位、任职、HC、薪酬和经历均为用户自述，需在沟通中验证"],
     verifyOnMeeting: ["公司与 HC 真实性", "实际工作负荷与成功标准", "任职时间线与项目成果"],
   };
 }
@@ -247,35 +286,113 @@ async function logout(request: Request, env: Env) {
   return json({ ok: true }, 200, { "set-cookie": `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0` });
 }
 
-async function rebuildMatchesForUser(env: Env, userId: string) {
-  const own = await env.DB.prepare("SELECT type FROM profiles WHERE user_id = ? AND status = 'pooled'")
-    .bind(userId).all<{ type: string }>();
-  if (own.results.length === 0) return;
+async function syncProfileIndex(env: Env, profileId: string, type: "role" | "talent", keywords: Array<[string, number]>) {
+  await env.DB.prepare("DELETE FROM profile_keywords WHERE profile_id = ?").bind(profileId).run();
+  for (let start = 0; start < keywords.length; start += 75) {
+    const statements = keywords.slice(start, start + 75).map(([keyword, weight]) =>
+      env.DB.prepare("INSERT INTO profile_keywords (profile_id, keyword, type, weight) VALUES (?, ?, ?, ?)")
+        .bind(profileId, keyword, type, weight));
+    if (statements.length) await env.DB.batch(statements);
+  }
+}
 
-  const pooled = await env.DB.prepare(`
-    SELECT id, user_id AS userId, type, payload
-    FROM profiles WHERE status = 'pooled'
-  `).all<{ id: string; userId: string; type: "role" | "talent"; payload: string }>();
-  const roles = pooled.results.filter((row) => row.type === "role");
-  const talents = pooled.results.filter((row) => row.type === "talent");
+async function finalizeHiddenExclusions(env: Env, userId: string, currentWeek: string) {
+  const hidden = await env.DB.prepare(`
+    SELECT DISTINCT m.role_profile_id AS roleProfileId, m.talent_profile_id AS talentProfileId
+    FROM matches m
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
+      AND (m.role_decision = 'hidden' OR m.talent_decision = 'hidden')
+  `).bind(currentWeek, userId, userId).all<{ roleProfileId: string; talentProfileId: string }>();
   const now = Math.floor(Date.now() / 1000);
-  const currentWeek = weekKey();
+  for (const row of hidden.results) {
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO match_exclusions (role_profile_id, talent_profile_id, reason, created_at)
+      VALUES (?, ?, 'hidden', ?)
+    `).bind(row.roleProfileId, row.talentProfileId, now).run();
+  }
+}
 
-  for (const role of roles) {
-    for (const talent of talents) {
-      if (role.userId === talent.userId || (role.userId !== userId && talent.userId !== userId)) continue;
-      const result = scorePair(JSON.parse(role.payload), JSON.parse(talent.payload));
-      if (result.score < 90) continue;
-      await env.DB.prepare(`
-        INSERT INTO matches (id, role_profile_id, talent_profile_id, score, reasons, risks, verify_on_meeting, week_key, role_decision, talent_decision, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)
-        ON CONFLICT(role_profile_id, talent_profile_id, week_key)
-        DO UPDATE SET score = excluded.score, reasons = excluded.reasons, risks = excluded.risks, verify_on_meeting = excluded.verify_on_meeting
-      `).bind(
-        crypto.randomUUID(), role.id, talent.id, result.score, JSON.stringify(result.reasons),
-        JSON.stringify(result.risks), JSON.stringify(result.verifyOnMeeting), currentWeek, now,
-      ).run();
+async function runMatchForProfile(env: Env, profileId: string, force = false) {
+  const profile = await env.DB.prepare(`
+    SELECT id, user_id AS userId, type, payload, embedding, content_version AS contentVersion, status
+    FROM profiles WHERE id = ?
+  `).bind(profileId).first<{ id: string; userId: string; type: "role" | "talent"; payload: string; embedding: string; contentVersion: number; status: string }>();
+  if (!profile || profile.status !== "pooled") return { candidates: 0, matches: 0 };
+  const currentWeek = weekKey();
+  const previous = await env.DB.prepare("SELECT content_version AS contentVersion FROM match_runs WHERE profile_id = ? AND week_key = ?")
+    .bind(profileId, currentWeek).first<{ contentVersion: number }>();
+  if (previous && !force) return { candidates: 0, matches: 0 };
+
+  const opposite = profile.type === "role" ? "talent" : "role";
+  const exclusion = profile.type === "role"
+    ? "e.role_profile_id = ? AND e.talent_profile_id = p.id"
+    : "e.talent_profile_id = ? AND e.role_profile_id = p.id";
+  const candidates = await env.DB.prepare(`
+    SELECT p.id, p.user_id AS userId, p.payload, p.embedding,
+      SUM(CASE WHEN mine.weight < other.weight THEN mine.weight ELSE other.weight END) AS sharedWeight
+    FROM profile_keywords mine
+    JOIN profile_keywords other ON other.keyword = mine.keyword
+    JOIN profiles p ON p.id = other.profile_id
+    WHERE mine.profile_id = ? AND other.type = ? AND p.status = 'pooled' AND p.user_id <> ?
+      AND NOT EXISTS (SELECT 1 FROM match_exclusions e WHERE ${exclusion})
+    GROUP BY p.id
+    ORDER BY sharedWeight DESC
+    LIMIT 100
+  `).bind(profileId, opposite, profile.userId, profileId).all<{ id: string; userId: string; payload: string; embedding: string; sharedWeight: number }>();
+
+  const ownIndex = buildProfileIndex(JSON.parse(profile.payload));
+  const ownWeight = ownIndex.keywords.reduce((sum, [, weight]) => sum + weight, 0) || 1;
+  const ownVector = JSON.parse(profile.embedding || "[]") as number[];
+  let matchedCount = 0;
+  const now = Math.floor(Date.now() / 1000);
+  for (const candidate of candidates.results) {
+    if (matchedCount >= 10) break;
+    const candidateIndex = buildProfileIndex(JSON.parse(candidate.payload));
+    const candidateWeight = candidateIndex.keywords.reduce((sum, [, weight]) => sum + weight, 0) || 1;
+    const coverage = Math.min(1, Number(candidate.sharedWeight) / Math.min(ownWeight, candidateWeight));
+    const keywordScore = Math.round(70 + coverage * 30);
+    if (keywordScore < 90) continue;
+    const candidateVector = JSON.parse(candidate.embedding || "[]") as number[];
+    const vectorScore = Math.round(Math.max(0, Math.min(1, (cosine(ownVector, candidateVector) + 1) / 2)) * 100);
+    const finalScore = Math.round(keywordScore * 0.75 + vectorScore * 0.25);
+    if (finalScore < 90) continue;
+    const roleId = profile.type === "role" ? profile.id : candidate.id;
+    const talentId = profile.type === "talent" ? profile.id : candidate.id;
+    const description = describeMatch(keywordScore, vectorScore);
+    await env.DB.prepare(`
+      INSERT INTO matches (id, role_profile_id, talent_profile_id, score, reasons, risks, verify_on_meeting, week_key, role_decision, talent_decision, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)
+      ON CONFLICT(role_profile_id, talent_profile_id, week_key)
+      DO UPDATE SET score = excluded.score, reasons = excluded.reasons, risks = excluded.risks, verify_on_meeting = excluded.verify_on_meeting
+    `).bind(crypto.randomUUID(), roleId, talentId, finalScore, JSON.stringify(description.reasons), JSON.stringify(description.risks), JSON.stringify(description.verifyOnMeeting), currentWeek, now).run();
+    matchedCount += 1;
+  }
+  await env.DB.prepare(`
+    INSERT INTO match_runs (profile_id, week_key, content_version, candidate_count, matched_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, week_key) DO UPDATE SET content_version = excluded.content_version,
+      candidate_count = excluded.candidate_count, matched_count = excluded.matched_count, created_at = excluded.created_at
+  `).bind(profileId, currentWeek, profile.contentVersion, candidates.results.length, matchedCount, now).run();
+  await env.DB.prepare("UPDATE profiles SET last_matched_week = ? WHERE id = ?").bind(currentWeek, profileId).run();
+  return { candidates: candidates.results.length, matches: matchedCount };
+}
+
+async function ensureWeeklyMatchesForUser(env: Env, userId: string) {
+  const currentWeek = weekKey();
+  await finalizeHiddenExclusions(env, userId, currentWeek);
+  const profiles = await env.DB.prepare(`
+    SELECT id, type, payload, search_text AS searchText FROM profiles WHERE user_id = ? AND status = 'pooled'
+  `).bind(userId).all<{ id: string; type: "role" | "talent"; payload: string; searchText: string }>();
+  for (const profile of profiles.results) {
+    if (!profile.searchText) {
+      const index = buildProfileIndex(JSON.parse(profile.payload));
+      await env.DB.prepare("UPDATE profiles SET search_text = ?, embedding = ? WHERE id = ?")
+        .bind(index.searchText, JSON.stringify(vectorize(index.searchText)), profile.id).run();
+      await syncProfileIndex(env, profile.id, profile.type, index.keywords);
     }
+    await runMatchForProfile(env, profile.id);
   }
 }
 
@@ -285,7 +402,7 @@ async function profilesApi(request: Request, env: Env) {
   if (request.method === "GET") {
     const result = await env.DB.prepare(`
       SELECT id, type, anonymous_code AS anonymousCode, payload, completion, status, updated_at AS updatedAt
-      FROM profiles WHERE user_id = ? ORDER BY type
+      FROM profiles WHERE user_id = ? AND status <> 'removed' ORDER BY type
     `).bind(auth.user.id).all<{ id: string; type: string; anonymousCode: string; payload: string; completion: number; status: string; updatedAt: number }>();
     return json({ profiles: result.results.map((row) => ({ ...row, payload: JSON.parse(row.payload) })) });
   }
@@ -300,26 +417,86 @@ async function profilesApi(request: Request, env: Env) {
   if (serialized.length > 30000) return json({ error: "发布内容过长" }, 413);
 
   const now = Math.floor(Date.now() / 1000);
-  const current = await env.DB.prepare("SELECT id, anonymous_code AS anonymousCode FROM profiles WHERE user_id = ? AND type = ?")
-    .bind(auth.user.id, type).first<{ id: string; anonymousCode: string }>();
+  const current = await env.DB.prepare("SELECT id, anonymous_code AS anonymousCode, status, content_version AS contentVersion FROM profiles WHERE user_id = ? AND type = ?")
+    .bind(auth.user.id, type).first<{ id: string; anonymousCode: string; status: string; contentVersion: number }>();
+  const recreating = current?.status === "removed";
+  if (recreating) {
+    const cycle = await env.DB.prepare("SELECT recreate_count AS recreateCount FROM publication_cycles WHERE user_id = ? AND type = ? AND month_key = ?")
+      .bind(auth.user.id, type, monthKey()).first<{ recreateCount: number }>();
+    if ((cycle?.recreateCount ?? 0) >= 1) return json({ error: "该方向本月的重新新建次数已用完" }, 429);
+    await env.DB.prepare(`
+      INSERT INTO publication_cycles (user_id, type, month_key, delete_count, recreate_count)
+      VALUES (?, ?, ?, 0, 1)
+      ON CONFLICT(user_id, type, month_key) DO UPDATE SET recreate_count = recreate_count + 1
+    `).bind(auth.user.id, type, monthKey()).run();
+  }
   const id = current?.id ?? crypto.randomUUID();
   const prefix = type === "role" ? "R" : "T";
-  const anonymousCode = current?.anonymousCode ?? `${prefix}-${String(Math.floor(Math.random() * 900000) + 100000)}`;
+  const anonymousCode = !current || recreating ? `${prefix}-${String(Math.floor(Math.random() * 900000) + 100000)}` : current.anonymousCode;
+  const index = buildProfileIndex(payload);
+  const embedding = vectorize(index.searchText);
+  const contentVersion = (current?.contentVersion ?? 0) + 1;
   await env.DB.prepare(`
-    INSERT INTO profiles (id, user_id, type, anonymous_code, payload, completion, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'pooled', ?, ?)
-    ON CONFLICT(user_id, type) DO UPDATE SET payload = excluded.payload, completion = excluded.completion, status = 'pooled', updated_at = excluded.updated_at
-  `).bind(id, auth.user.id, type, anonymousCode, serialized, completion, now, now).run();
-  await rebuildMatchesForUser(env, auth.user.id);
+    INSERT INTO profiles (id, user_id, type, anonymous_code, payload, search_text, embedding, content_version, completion, status, created_at, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pooled', ?, ?, NULL)
+    ON CONFLICT(user_id, type) DO UPDATE SET anonymous_code = excluded.anonymous_code, payload = excluded.payload,
+      search_text = excluded.search_text, embedding = excluded.embedding, content_version = excluded.content_version,
+      completion = excluded.completion, status = 'pooled', updated_at = excluded.updated_at, deleted_at = NULL
+  `).bind(id, auth.user.id, type, anonymousCode, serialized, index.searchText, JSON.stringify(embedding), contentVersion, completion, now, now).run();
+  await syncProfileIndex(env, id, type, index.keywords);
+  if (!current || recreating) {
+    if (recreating) {
+      await env.DB.prepare(`
+        DELETE FROM matches WHERE week_key = ?
+          AND (role_profile_id = ? OR talent_profile_id = ?)
+          AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.match_id = matches.id)
+      `).bind(weekKey(), id, id).run();
+    }
+    await runMatchForProfile(env, id, true);
+  }
   return json({ ok: true, profile: { id, type, anonymousCode, payload, completion, status: "pooled", updatedAt: now } });
+}
+
+async function profileLifecycleApi(request: Request, env: Env, type: "role" | "talent") {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  const profile = await env.DB.prepare("SELECT id, status FROM profiles WHERE user_id = ? AND type = ?")
+    .bind(auth.user.id, type).first<{ id: string; status: string }>();
+  if (!profile || profile.status === "removed") return json({ error: "发布不存在" }, 404);
+  const now = Math.floor(Date.now() / 1000);
+  if (request.method === "DELETE") {
+    const cycle = await env.DB.prepare("SELECT delete_count AS deleteCount FROM publication_cycles WHERE user_id = ? AND type = ? AND month_key = ?")
+      .bind(auth.user.id, type, monthKey()).first<{ deleteCount: number }>();
+    if ((cycle?.deleteCount ?? 0) >= 1) return json({ error: "该方向本月的删除次数已用完" }, 429);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE profiles SET status = 'removed', deleted_at = ?, updated_at = ? WHERE id = ?").bind(now, now, profile.id),
+      env.DB.prepare("DELETE FROM profile_keywords WHERE profile_id = ?").bind(profile.id),
+      env.DB.prepare(`
+        INSERT INTO publication_cycles (user_id, type, month_key, delete_count, recreate_count)
+        VALUES (?, ?, ?, 1, 0)
+        ON CONFLICT(user_id, type, month_key) DO UPDATE SET delete_count = delete_count + 1
+      `).bind(auth.user.id, type, monthKey()),
+    ]);
+    return json({ ok: true, status: "removed" });
+  }
+  if (request.method === "PATCH") {
+    const body = await requestBody(request);
+    const status = body?.status === "paused" || body?.status === "pooled" ? body.status : null;
+    if (!status) return json({ error: "状态无效" }, 400);
+    await env.DB.prepare("UPDATE profiles SET status = ?, updated_at = ? WHERE id = ?").bind(status, now, profile.id).run();
+    return json({ ok: true, status });
+  }
+  return json({ error: "不支持的请求" }, 405);
 }
 
 async function dashboardApi(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (auth.response || !auth.user) return auth.response!;
+  await ensureWeeklyMatchesForUser(env, auth.user.id);
   const profiles = await env.DB.prepare(`
     SELECT id, type, anonymous_code AS anonymousCode, payload, completion, status, updated_at AS updatedAt
-    FROM profiles WHERE user_id = ? ORDER BY type
+    FROM profiles WHERE user_id = ? AND status <> 'removed' ORDER BY type
   `).bind(auth.user.id).all<{ id: string; type: string; anonymousCode: string; payload: string; completion: number; status: string; updatedAt: number }>();
   const profileRows = profiles.results.map((row) => ({ ...row, payload: JSON.parse(row.payload) }));
   const readyForMatching = profileRows.some((row) => row.status === "pooled");
@@ -335,10 +512,10 @@ async function dashboardApi(request: Request, env: Env) {
     JOIN profiles tp ON tp.id = m.talent_profile_id
     LEFT JOIN conversations c ON c.match_id = m.id
     WHERE m.week_key = ? AND (rp.user_id = ? OR tp.user_id = ?)
-    ORDER BY m.score DESC LIMIT 10
+    ORDER BY m.score DESC LIMIT 40
   `).bind(weekKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>() : { results: [] };
 
-  const matches = matchRows.results.map((row) => {
+  const allMatches = matchRows.results.map((row) => {
     const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
     const opposingPayload = JSON.parse(String(perspective === "role" ? row.talentPayload : row.rolePayload));
     const ownDecision = String(perspective === "role" ? row.roleDecision : row.talentDecision);
@@ -351,6 +528,10 @@ async function dashboardApi(request: Request, env: Env) {
       verifyOnMeeting: JSON.parse(String(row.verifyOnMeeting)), conversationId: row.conversationId,
     };
   });
+  const matches = [
+    ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
+    ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
+  ].sort((a, b) => Number(b.score) - Number(a.score));
   const notifications = matches
     .filter((match) => match.ownDecision === "interested" && match.otherDecision === "interested" && !match.conversationId)
     .map((match) => ({ id: `mutual-${match.id}`, matchId: match.id, type: "mutual_match", anonymousCode: match.anonymousCode, score: match.score }));
@@ -369,9 +550,21 @@ async function dashboardApi(request: Request, env: Env) {
     ORDER BY c.created_at DESC
   `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
 
+  const cycles = await env.DB.prepare(`
+    SELECT type, delete_count AS deleteCount, recreate_count AS recreateCount
+    FROM publication_cycles WHERE user_id = ? AND month_key = ?
+  `).bind(auth.user.id, monthKey()).all<{ type: "role" | "talent"; deleteCount: number; recreateCount: number }>();
+  const publicationLimits = {
+    role: { canDelete: true, canRecreate: true },
+    talent: { canDelete: true, canRecreate: true },
+  };
+  for (const cycle of cycles.results) {
+    publicationLimits[cycle.type] = { canDelete: cycle.deleteCount < 1, canRecreate: cycle.recreateCount < 1 };
+  }
+
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, readyForMatching, matches, notifications, conversations: conversations.results,
+    profiles: profileRows, publicationLimits, readyForMatching, matches, notifications, conversations: conversations.results,
   });
 }
 
@@ -436,6 +629,10 @@ async function api(request: Request, env: Env) {
     return user ? json({ user: { email: user.email, reputation: user.reputation, isAdmin: isAdmin(env, user.email) } }) : json({ user: null }, 401);
   }
   if (pathname === "/api/profiles") return profilesApi(request, env);
+  const profileLifecycleMatch = pathname.match(/^\/api\/profiles\/(role|talent)$/);
+  if (profileLifecycleMatch && (request.method === "PATCH" || request.method === "DELETE")) {
+    return profileLifecycleApi(request, env, profileLifecycleMatch[1] as "role" | "talent");
+  }
   if (pathname === "/api/dashboard" && request.method === "GET") return dashboardApi(request, env);
   const decisionMatch = pathname.match(/^\/api\/matches\/([^/]+)\/decision$/);
   if (decisionMatch && request.method === "PUT") return matchDecisionApi(request, env, decisionMatch[1]);
