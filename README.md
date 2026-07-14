@@ -1,98 +1,63 @@
-# vinext-starter
+# Relay 接棒
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+一个不能浏览的私密 AI 职业匹配网络。用户可以同时发布一条“待接棒岗位”和一条“找工作画像”，只有当 AI 双向匹配超过 90 分时才建立匿名连接。
 
-## Prerequisites
+## 功能
 
-- Node.js `>=22.13.0`
+- 邮箱验证登录（当前 UI 为演示流程）
+- 待接棒岗位与求职画像，每类每账号最多一条
+- 每周最多 10 条匿名匹配
+- 匹配理由、风险和面谈验证项
+- 匿名站内沟通
+- 信誉流水、举报、陪审、过半封号和申诉
+- 只向 100 分信誉用户随机发放陪审案件
 
-## Quick Start
+## 一键安装
+
+需要 Node.js 22.13 或更高版本。克隆仓库后只需运行：
 
 ```bash
-npm install
+npm run setup
+```
+
+该命令会安装依赖、生成 D1/SQLite 数据库迁移，并执行生产构建验证。完成后启动：
+
+```bash
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+## 数据库
 
-## Included Shape
+项目使用 Drizzle ORM + Cloudflare D1（SQLite）。数据模型包含：
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+- `users`：邮箱账号、信誉分与封禁状态
+- `profiles`：接棒/求职画像，数据库约束每人每类仅一条
+- `matches`：每周匹配分、理由、风险和双方决定
+- `conversations` / `messages`：匿名会话
+- `reputation_events`：可审计的信誉加减分流水
+- `reports`：虚假岗位、虚假简历、骗钱等举报
+- `jury_assignments` / `jury_votes`：随机陪审任务与投票
+- `appeals`：封号申诉和人工复核结果
 
-## Workspace Auth Headers
+修改 [db/schema.ts](db/schema.ts) 后运行：
 
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm run db:generate
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+## 部署
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+当前结构使用 vinext，适合部署到 Cloudflare Workers / OpenAI Sites 的免费层。`.openai/hosting.json` 已声明 `DB` D1 绑定，真实数据库由部署平台创建和注入。
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+## 开发命令
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+```bash
+npm run dev          # 本地开发
+npm run build        # 生产构建
+npm run db:generate  # 生成数据库迁移
+npm run lint         # 代码检查
+```
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+## 当前边界
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+邮箱发信、真实 AI 解析和前端到数据库的写入接口尚未接入。当前版本为完整可操作的产品原型，数据库 schema 和迁移已就绪。
