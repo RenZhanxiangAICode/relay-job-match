@@ -7,6 +7,7 @@ interface Env {
   RESEND_API_KEY?: string;
   EMAIL_FROM?: string;
   AUTH_SECRET?: string;
+  ADMIN_EMAILS?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -40,6 +41,50 @@ function normalizeEmail(value: unknown) {
 
 function validEmail(email: string) {
   return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isAdmin(env: Env, email: string) {
+  return (env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .includes(email.toLowerCase());
+}
+
+function weekKey(date = new Date()) {
+  const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = utc.getUTCDay() || 7;
+  utc.setUTCDate(utc.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((utc.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  return `${utc.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+function words(value: unknown) {
+  return String(value ?? "").toLowerCase().split(/[\s,，。；;、/|·\-]+/).filter((item) => item.length > 1);
+}
+
+function overlap(a: unknown, b: unknown) {
+  const left = new Set(words(a));
+  return words(b).filter((item) => left.has(item)).length;
+}
+
+function scorePair(role: Record<string, unknown>, talent: Record<string, unknown>) {
+  let score = 72;
+  const reasons: string[] = [];
+  const cityHits = overlap(role.city, talent.city);
+  const industryHits = overlap(role.industry, talent.industry);
+  const abilityHits = overlap(`${role.ability} ${role.knowledge}`, `${talent.ability} ${talent.credential}`);
+  if (cityHits) { score += 8; reasons.push("城市与工作方式偏好有交集"); }
+  if (industryHits) { score += 7; reasons.push("行业兴趣与岗位背景相符"); }
+  if (abilityHits) { score += Math.min(12, abilityHits * 4); reasons.push("能力与岗位要求存在可验证交集"); }
+  if (overlap(role.system, talent.salary)) { score += 5; reasons.push("薪酬期望存在交集"); }
+  return {
+    score: Math.min(98, score),
+    reasons: reasons.length ? reasons : ["基础条件存在一定交集，仍需更多资料验证"],
+    risks: ["岗位、任职、HC、薪酬和经历均为用户自述，平台第一版不作第三方认证"],
+    verifyOnMeeting: ["公司与 HC 真实性", "实际工作负荷与成功标准", "任职时间线与项目成果"],
+  };
 }
 
 async function sha256(value: string) {
@@ -202,6 +247,38 @@ async function logout(request: Request, env: Env) {
   return json({ ok: true }, 200, { "set-cookie": `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0` });
 }
 
+async function rebuildMatchesForUser(env: Env, userId: string) {
+  const own = await env.DB.prepare("SELECT type FROM profiles WHERE user_id = ? AND status = 'pooled'")
+    .bind(userId).all<{ type: string }>();
+  if (own.results.length === 0) return;
+
+  const pooled = await env.DB.prepare(`
+    SELECT id, user_id AS userId, type, payload
+    FROM profiles WHERE status = 'pooled'
+  `).all<{ id: string; userId: string; type: "role" | "talent"; payload: string }>();
+  const roles = pooled.results.filter((row) => row.type === "role");
+  const talents = pooled.results.filter((row) => row.type === "talent");
+  const now = Math.floor(Date.now() / 1000);
+  const currentWeek = weekKey();
+
+  for (const role of roles) {
+    for (const talent of talents) {
+      if (role.userId === talent.userId || (role.userId !== userId && talent.userId !== userId)) continue;
+      const result = scorePair(JSON.parse(role.payload), JSON.parse(talent.payload));
+      if (result.score < 90) continue;
+      await env.DB.prepare(`
+        INSERT INTO matches (id, role_profile_id, talent_profile_id, score, reasons, risks, verify_on_meeting, week_key, role_decision, talent_decision, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)
+        ON CONFLICT(role_profile_id, talent_profile_id, week_key)
+        DO UPDATE SET score = excluded.score, reasons = excluded.reasons, risks = excluded.risks, verify_on_meeting = excluded.verify_on_meeting
+      `).bind(
+        crypto.randomUUID(), role.id, talent.id, result.score, JSON.stringify(result.reasons),
+        JSON.stringify(result.risks), JSON.stringify(result.verifyOnMeeting), currentWeek, now,
+      ).run();
+    }
+  }
+}
+
 async function profilesApi(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (auth.response || !auth.user) return auth.response!;
@@ -233,7 +310,120 @@ async function profilesApi(request: Request, env: Env) {
     VALUES (?, ?, ?, ?, ?, ?, 'pooled', ?, ?)
     ON CONFLICT(user_id, type) DO UPDATE SET payload = excluded.payload, completion = excluded.completion, status = 'pooled', updated_at = excluded.updated_at
   `).bind(id, auth.user.id, type, anonymousCode, serialized, completion, now, now).run();
+  await rebuildMatchesForUser(env, auth.user.id);
   return json({ ok: true, profile: { id, type, anonymousCode, payload, completion, status: "pooled", updatedAt: now } });
+}
+
+async function dashboardApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  const profiles = await env.DB.prepare(`
+    SELECT id, type, anonymous_code AS anonymousCode, payload, completion, status, updated_at AS updatedAt
+    FROM profiles WHERE user_id = ? ORDER BY type
+  `).bind(auth.user.id).all<{ id: string; type: string; anonymousCode: string; payload: string; completion: number; status: string; updatedAt: number }>();
+  const profileRows = profiles.results.map((row) => ({ ...row, payload: JSON.parse(row.payload) }));
+  const readyForMatching = profileRows.some((row) => row.status === "pooled");
+
+  const matchRows = readyForMatching ? await env.DB.prepare(`
+    SELECT m.id, m.score, m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
+      m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
+      rp.user_id AS roleUserId, rp.anonymous_code AS roleCode, rp.payload AS rolePayload,
+      tp.user_id AS talentUserId, tp.anonymous_code AS talentCode, tp.payload AS talentPayload,
+      c.id AS conversationId
+    FROM matches m
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    LEFT JOIN conversations c ON c.match_id = m.id
+    WHERE m.week_key = ? AND (rp.user_id = ? OR tp.user_id = ?)
+    ORDER BY m.score DESC LIMIT 10
+  `).bind(weekKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>() : { results: [] };
+
+  const matches = matchRows.results.map((row) => {
+    const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
+    const opposingPayload = JSON.parse(String(perspective === "role" ? row.talentPayload : row.rolePayload));
+    const ownDecision = String(perspective === "role" ? row.roleDecision : row.talentDecision);
+    const otherDecision = String(perspective === "role" ? row.talentDecision : row.roleDecision);
+    return {
+      id: row.id, score: row.score, perspective, ownDecision, otherDecision,
+      anonymousCode: perspective === "role" ? row.talentCode : row.roleCode,
+      payload: opposingPayload,
+      reasons: JSON.parse(String(row.reasons)), risks: JSON.parse(String(row.risks)),
+      verifyOnMeeting: JSON.parse(String(row.verifyOnMeeting)), conversationId: row.conversationId,
+    };
+  });
+  const notifications = matches
+    .filter((match) => match.ownDecision === "interested" && match.otherDecision === "interested" && !match.conversationId)
+    .map((match) => ({ id: `mutual-${match.id}`, matchId: match.id, type: "mutual_match", anonymousCode: match.anonymousCode, score: match.score }));
+
+  const conversations = await env.DB.prepare(`
+    SELECT c.id, c.match_id AS matchId,
+      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
+      m.score,
+      (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
+      (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount
+    FROM conversations c
+    JOIN matches m ON m.id = c.match_id
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE rp.user_id = ? OR tp.user_id = ?
+    ORDER BY c.created_at DESC
+  `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
+
+  return json({
+    user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
+    profiles: profileRows, readyForMatching, matches, notifications, conversations: conversations.results,
+  });
+}
+
+async function matchDecisionApi(request: Request, env: Env, matchId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  const body = await requestBody(request);
+  const decision = body?.decision === "pending" || body?.decision === "interested" || body?.decision === "hidden" ? body.decision : null;
+  if (!decision) return json({ error: "选择无效" }, 400);
+  const match = await env.DB.prepare(`
+    SELECT rp.user_id AS roleUserId, tp.user_id AS talentUserId
+    FROM matches m JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE m.id = ?
+  `).bind(matchId).first<{ roleUserId: string; talentUserId: string }>();
+  if (!match || (match.roleUserId !== auth.user.id && match.talentUserId !== auth.user.id)) return json({ error: "匹配不存在" }, 404);
+  const column = match.roleUserId === auth.user.id ? "role_decision" : "talent_decision";
+  await env.DB.prepare(`UPDATE matches SET ${column} = ? WHERE id = ?`).bind(decision, matchId).run();
+  return json({ ok: true });
+}
+
+async function startConversationApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  const body = await requestBody(request);
+  const matchId = typeof body?.matchId === "string" ? body.matchId : "";
+  const match = await env.DB.prepare(`
+    SELECT m.id, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
+      rp.user_id AS roleUserId, tp.user_id AS talentUserId
+    FROM matches m JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE m.id = ?
+  `).bind(matchId).first<{ id: string; roleDecision: string; talentDecision: string; roleUserId: string; talentUserId: string }>();
+  if (!match || (match.roleUserId !== auth.user.id && match.talentUserId !== auth.user.id)) return json({ error: "匹配不存在" }, 404);
+  if (match.roleDecision !== "interested" || match.talentDecision !== "interested") return json({ error: "只有双方匹配成功后才能开始沟通" }, 409);
+  const existing = await env.DB.prepare("SELECT id FROM conversations WHERE match_id = ?").bind(matchId).first<{ id: string }>();
+  const id = existing?.id ?? crypto.randomUUID();
+  if (!existing) await env.DB.prepare("INSERT INTO conversations (id, match_id, created_at) VALUES (?, ?, ?)")
+    .bind(id, matchId, Math.floor(Date.now() / 1000)).run();
+  return json({ ok: true, conversationId: id });
+}
+
+async function adminSummaryApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!isAdmin(env, auth.user.email)) return json({ error: "无管理员权限" }, 403);
+  const [users, reports, appeals] = await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) AS count FROM users").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM reports WHERE status = 'jury'").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM appeals WHERE status = 'pending'").first<{ count: number }>(),
+  ]);
+  return json({ users: users?.count ?? 0, activeReports: reports?.count ?? 0, pendingAppeals: appeals?.count ?? 0 });
 }
 
 async function api(request: Request, env: Env) {
@@ -243,9 +433,14 @@ async function api(request: Request, env: Env) {
   if (pathname === "/api/auth/logout" && request.method === "POST") return logout(request, env);
   if (pathname === "/api/auth/me" && request.method === "GET") {
     const user = await currentUser(request, env);
-    return user ? json({ user: { email: user.email, reputation: user.reputation } }) : json({ user: null }, 401);
+    return user ? json({ user: { email: user.email, reputation: user.reputation, isAdmin: isAdmin(env, user.email) } }) : json({ user: null }, 401);
   }
   if (pathname === "/api/profiles") return profilesApi(request, env);
+  if (pathname === "/api/dashboard" && request.method === "GET") return dashboardApi(request, env);
+  const decisionMatch = pathname.match(/^\/api\/matches\/([^/]+)\/decision$/);
+  if (decisionMatch && request.method === "PUT") return matchDecisionApi(request, env, decisionMatch[1]);
+  if (pathname === "/api/conversations" && request.method === "POST") return startConversationApi(request, env);
+  if (pathname === "/api/admin/summary" && request.method === "GET") return adminSummaryApi(request, env);
   return json({ error: "接口不存在" }, 404);
 }
 

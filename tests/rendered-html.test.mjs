@@ -46,10 +46,15 @@ test("keeps real email auth and persistent profiles wired", async () => {
   assert.match(page, /\/api\/auth\/request-code/);
   assert.match(page, /\/api\/auth\/verify-code/);
   assert.match(page, /\/api\/profiles/);
+  assert.match(page, /readyForMatching/);
+  assert.match(page, /view==="admin"&&isAdmin/);
+  assert.doesNotMatch(page, /R-1904|T-8821|J-2041|R-88102/);
   assert.match(worker, /https:\/\/api\.resend\.com\/emails/);
   assert.match(worker, /HttpOnly; Secure; SameSite=Lax/);
   assert.match(worker, /INSERT INTO email_verification_codes/);
   assert.match(worker, /ON CONFLICT\(user_id, type\)/);
+  assert.match(worker, /ADMIN_EMAILS/);
+  assert.match(worker, /\u65e0\u7ba1\u7406\u5458\u6743\u9650/);
   assert.equal(JSON.parse(hosting).d1, "DB");
   assert.match(envExample, /RESEND_API_KEY=/);
   assert.match(envExample, /AUTH_SECRET=/);
