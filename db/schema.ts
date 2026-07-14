@@ -10,6 +10,21 @@ export const users = sqliteTable("users", {
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("users_email_unique").on(table.email)]);
 
+export const emailVerificationCodes = sqliteTable("email_verification_codes", {
+  email: text("email").primaryKey(),
+  codeHash: text("code_hash").notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  attempts: integer("attempts").notNull().default(0),
+  sentAt: integer("sent_at", { mode: "timestamp" }).notNull(),
+});
+
+export const sessions = sqliteTable("sessions", {
+  tokenHash: text("token_hash").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [index("sessions_user_idx").on(table.userId)]);
+
 export const profiles = sqliteTable("profiles", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),

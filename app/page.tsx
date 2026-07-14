@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Mode = "role" | "talent";
 type View = "home" | "posts" | "matches" | "messages" | "trust" | "jury" | "admin";
@@ -49,15 +49,18 @@ const juryCases = [
 
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
   const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
   const [codeSent, setCodeSent] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [view, setView] = useState<View>("home");
   const [mode, setMode] = useState<Mode>("role");
   const [profileOpen, setProfileOpen] = useState(false);
   const [rawOpen, setRawOpen] = useState(false);
   const [raw, setRaw] = useState("");
   const [values, setValues] = useState<Record<string,string>>({});
-  const [saved, setSaved] = useState(false);
+  const [profileMeta, setProfileMeta] = useState<Record<Mode,{anonymousCode:string;status:string}|undefined>>({ role:undefined, talent:undefined });
   const [liked, setLiked] = useState<number[]>([]);
   const [hidden, setHidden] = useState<number[]>([]);
   const [selectedCase, setSelectedCase] = useState(0);
@@ -66,7 +69,55 @@ export default function Home() {
   const fields = mode === "role" ? roleFields : talentFields;
   const completion = useMemo(() => Math.round(fields.filter(f => values[`${mode}-${f.key}`]?.trim()).length / fields.length * 100), [fields, mode, values]);
 
-  function login(e:FormEvent){ e.preventDefault(); if(!codeSent){setCodeSent(true);setToast("演示邮箱验证码：246810");return} setLoggedIn(true);setToast("邮箱已验证，已进入安全账户"); }
+  useEffect(()=>{
+    fetch("/api/auth/me").then(async response=>{
+      if(!response.ok) return;
+      const data = await response.json() as {user?:{email:string}};
+      if(data.user){setEmail(data.user.email);setLoggedIn(true)}
+    }).finally(()=>setAuthChecking(false));
+  },[]);
+
+  useEffect(()=>{
+    if(!loggedIn) return;
+    fetch("/api/profiles").then(async response=>{
+      if(!response.ok) return;
+      const data = await response.json() as {profiles:Array<{type:Mode;anonymousCode:string;status:string;payload:Record<string,string>}>};
+      const nextValues:Record<string,string> = {};
+      const nextMeta:Record<Mode,{anonymousCode:string;status:string}|undefined> = {role:undefined,talent:undefined};
+      data.profiles.forEach(profile=>{
+        nextMeta[profile.type]={anonymousCode:profile.anonymousCode,status:profile.status};
+        Object.entries(profile.payload).forEach(([key,value])=>nextValues[`${profile.type}-${key}`]=String(value??""));
+      });
+      setValues(nextValues);setProfileMeta(nextMeta);
+    }).catch(()=>flash("资料读取失败，请刷新后重试"));
+  },[loggedIn]);
+
+  async function login(e:FormEvent){
+    e.preventDefault();setBusy(true);
+    try{
+      const response=await fetch(codeSent?"/api/auth/verify-code":"/api/auth/request-code",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(codeSent?{email,code}:{email})});
+      const data=await response.json() as {error?:string;message?:string};
+      if(!response.ok) throw new Error(data.error||"请求失败，请稍后再试");
+      if(!codeSent){setCodeSent(true);flash(data.message||"验证码已发送，请检查邮箱");return}
+      setLoggedIn(true);flash("邮箱已验证，已进入安全账户");
+    }catch(error){flash(error instanceof Error?error.message:"请求失败，请稍后再试")}finally{setBusy(false)}
+  }
+
+  async function saveProfile(){
+    const requiredMissing=fields.some(field=>field.required&&!values[`${mode}-${field.key}`]?.trim());
+    if(requiredMissing){flash("请先填写所有必填项");return}
+    setBusy(true);
+    try{
+      const payload=Object.fromEntries(fields.map(field=>[field.key,values[`${mode}-${field.key}`]||""]));
+      const response=await fetch("/api/profiles",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({type:mode,payload,completion})});
+      const data=await response.json() as {error?:string;profile?:{anonymousCode:string;status:string}};
+      if(!response.ok||!data.profile) throw new Error(data.error||"保存失败");
+      setProfileMeta(meta=>({...meta,[mode]:{anonymousCode:data.profile!.anonymousCode,status:data.profile!.status}}));
+      setProfileOpen(false);flash(mode==="role"?"接棒信息已真实保存并进入匹配池":"求职信息已真实保存并进入匹配池");
+    }catch(error){flash(error instanceof Error?error.message:"保存失败，请稍后再试")}finally{setBusy(false)}
+  }
+
+  async function logout(){await fetch("/api/auth/logout",{method:"POST"});setLoggedIn(false);setCodeSent(false);setCode("");setValues({});setProfileMeta({role:undefined,talent:undefined});flash("已安全退出")}
   function flash(text:string){setToast(text);setTimeout(()=>setToast(""),2600)}
   function parseText(){
     const chunks = raw.split(/[\n，。；;]+/).filter(Boolean);
@@ -76,10 +127,12 @@ export default function Home() {
   }
   function nav(next:View){setView(next);window.scrollTo({top:0,behavior:"smooth"})}
 
+  if(authChecking) return <main className="login-page"><div className="login-brand"><span className="brand-mark">R</span><b>Relay 接棒</b></div><section className="login-copy"><h1>正在确认<br/><em>安全登录状态…</em></h1></section></main>;
+
   if(!loggedIn) return <main className="login-page">
     <div className="login-brand"><span className="brand-mark">R</span><b>Relay 接棒</b></div>
     <section className="login-copy"><span className="overline">PRIVATE TALENT NETWORK</span><h1>不用浏览。<br/><em>只见真正适合的人。</em></h1><p>你的岗位和简历都不会公开。AI 每周从私密池中筛选 10 个机会，只在匹配超过 90 分时为双方建立连接。</p><div className="login-proof"><span>仅邮箱验证</span><span>全程匿名沟通</span><span>社区过半自动处置</span></div></section>
-    <section className="login-box"><span className="step-tag">安全入口</span><h2>邮箱登录</h2><p>一个邮箱对应一个匿名账号。第一版不收集、不认证手机号。</p><form onSubmit={login}><label>邮箱地址</label><div className="phone-input"><span>@</span><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com" required/></div>{codeSent&&<><label>邮箱验证码</label><input className="code-input" placeholder="输入 246810" required/></>}<button>{codeSent?"验证邮箱并进入":"发送邮箱验证码"}<span>→</span></button></form><small>当前为产品演示，不会发送真实邮件。</small></section>
+    <section className="login-box"><span className="step-tag">安全入口</span><h2>邮箱登录</h2><p>一个邮箱对应一个匿名账号。第一版不收集、不认证手机号。</p><form onSubmit={login}><label>邮箱地址</label><div className="phone-input"><span>@</span><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com" required disabled={codeSent||busy}/></div>{codeSent&&<><label>邮箱验证码</label><input className="code-input" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,"").slice(0,6))} inputMode="numeric" autoComplete="one-time-code" placeholder="输入邮件中的 6 位验证码" required/></>}<button disabled={busy}>{busy?"正在处理…":codeSent?"验证邮箱并进入":"发送邮箱验证码"}<span>→</span></button></form>{codeSent&&<button className="text-button" onClick={()=>{setCodeSent(false);setCode("")}}>更换邮箱或重新发送</button>}<small>验证码会真实发送到你的邮箱，10 分钟内有效。</small></section>
     {toast&&<div className="toast">{toast}</div>}
   </main>;
 
@@ -94,7 +147,7 @@ export default function Home() {
         <button className={view==="trust"?"active":""} onClick={()=>nav("trust")}><span>✓</span>信任护照</button>
         <button className={view==="jury"?"active":""} onClick={()=>nav("jury")}><span>⚖</span>公民陪审</button>
       </nav>
-      <div className="side-bottom"><button className={view==="admin"?"active":""} onClick={()=>nav("admin")}><span>⚙</span>管理员控制台</button><div className="user-chip"><span>R</span><div><b>匿名用户 2716</b><small>信誉分 100 · 邮箱已验证</small></div></div></div>
+      <div className="side-bottom"><button className={view==="admin"?"active":""} onClick={()=>nav("admin")}><span>⚙</span>管理员控制台</button><div className="user-chip"><span>R</span><div><b>{profileMeta.talent?.anonymousCode||profileMeta.role?.anonymousCode||"新匿名用户"}</b><small>{email} · 邮箱已验证</small></div><button onClick={logout} aria-label="退出登录">退出</button></div></div>
     </aside>
     <div className="mobile-nav"><button onClick={()=>nav("home")}>首页</button><button onClick={()=>nav("matches")}>匹配</button><button onClick={()=>nav("messages")}>沟通</button><button onClick={()=>nav("jury")}>陪审</button></div>
     <section className="workspace">
@@ -120,7 +173,7 @@ export default function Home() {
       {view==="admin"&&<div className="page admin-page"><div className="page-heading"><div><span className="overline">APPEAL & JURY QUALITY</span><h1>申诉与陪审质量</h1><p>首次处置完全由陪审票决定；人工只复核被封账号的申诉，并调查是否存在多次恶意投票。</p></div><button className="export-btn" onClick={()=>flash("已生成脱敏陪审质量报告")}>导出陪审报告</button></div><div className="admin-stats">{[["8","待处理申诉"],["3","疑似恶意陪审者"],["12","今日过半自动封号"],["4.1%","封号申诉率"]].map(x=><div key={x[1]}><b>{x[0]}</b><span>{x[1]}</span></div>)}</div><section className="risk-table"><header><h2>申诉复核队列</h2><div><button className="active">全部</button><button>虚假广告</button><button>涉嫌骗钱</button><button>简历造假</button></div></header><div className="table-head"><span>匿名账号 / 申诉</span><span>原封号原因</span><span>陪审结果</span><span>状态</span><span>操作</span></div>{[["R-88102 · 已提交申诉","索要内推费","57% 拉黑票","待申诉复核"],["T-09211 · 已提交申诉","任职时间矛盾","64% 拉黑票","调查陪审者"],["R-12094 · 申诉已完成","批量重复岗位","52% 拉黑票","维持封号"]].map((x,i)=><div className="table-row" key={x[0]}><span><b>{x[0]}</b><small>仅邮箱已验证</small></span><span>{x[1]}</span><span>{x[2]}</span><span><i className={i===0?"pending":i===1?"danger":"limited"}>{x[3]}</i></span><span className="row-actions"><button onClick={()=>flash(i===1?"已对涉嫌多次恶意投票者扣减信誉分":"申诉复核结果已记录")}>{i===1?"扣陪审信誉":"处理申诉"}</button></span></div>)}</section></div>}
     </section>
 
-    {profileOpen&&<div className="drawer-backdrop" onClick={()=>setProfileOpen(false)}><section className="profile-drawer" onClick={e=>e.stopPropagation()}><header><div><span className="overline">PRIVATE PROFILE · 1 / 1</span><h2>{mode==="role"?"修改待接棒岗位":"修改找工作画像"}</h2><p>{mode==="role"?"每个账号只有一条待接棒岗位，保存后会更新原记录。":"每个账号只有一条求职画像，保存后会更新原记录。"}</p></div><button onClick={()=>setProfileOpen(false)}>×</button></header><div className="contact-lock"><div><b>已验证登录邮箱</b><span>只用于登录和账号通知，不对匹配对象展示</span></div><div className="contact-grid one"><label>邮箱<input type="email" value={email||"demo@relay.cn"} readOnly/></label></div></div><div className="field-grid">{fields.map(f=><label key={f.key}><span>{f.label}{f.required&&<i>必填</i>}</span><textarea rows={3} placeholder={f.hint} value={values[`${mode}-${f.key}`]||""} onChange={e=>setValues(v=>({...v,[`${mode}-${f.key}`]:e.target.value}))}/></label>)}</div><footer><div><b>{completion}%</b><span>画像完整度</span></div><button className="outline" onClick={()=>{setProfileOpen(false);setRawOpen(true)}}>AI 帮我补齐</button><button className="solid" onClick={()=>{setSaved(true);setProfileOpen(false);flash(mode==="role"?"接棒信息已更新，仍占用唯一名额":"求职信息已更新，仍占用唯一名额")}}>{saved?"保存修改":"确认并匿名入池"}</button></footer></section></div>}
+    {profileOpen&&<div className="drawer-backdrop" onClick={()=>setProfileOpen(false)}><section className="profile-drawer" onClick={e=>e.stopPropagation()}><header><div><span className="overline">PRIVATE PROFILE · 1 / 1</span><h2>{mode==="role"?"修改待接棒岗位":"修改找工作画像"}</h2><p>{mode==="role"?"每个账号只有一条待接棒岗位，保存后会更新原记录。":"每个账号只有一条求职画像，保存后会更新原记录。"}</p></div><button onClick={()=>setProfileOpen(false)}>×</button></header><div className="contact-lock"><div><b>已验证登录邮箱</b><span>只用于登录和账号通知，不对匹配对象展示</span></div><div className="contact-grid one"><label>邮箱<input type="email" value={email} readOnly/></label></div></div><div className="field-grid">{fields.map(f=><label key={f.key}><span>{f.label}{f.required&&<i>必填</i>}</span><textarea rows={3} placeholder={f.hint} value={values[`${mode}-${f.key}`]||""} onChange={e=>setValues(v=>({...v,[`${mode}-${f.key}`]:e.target.value}))}/></label>)}</div><footer><div><b>{completion}%</b><span>画像完整度</span></div><button className="outline" onClick={()=>{setProfileOpen(false);setRawOpen(true)}}>AI 帮我补齐</button><button className="solid" disabled={busy} onClick={saveProfile}>{busy?"正在保存…":profileMeta[mode]?"保存真实修改":"确认并匿名入池"}</button></footer></section></div>}
 
     {rawOpen&&<div className="modal-backdrop" onClick={()=>setRawOpen(false)}><section className="raw-modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setRawOpen(false)}>×</button><span className="overline">AI STRUCTURED READING</span><h2>随便说，我来整理。</h2><p>可以直接粘贴一段话、旧简历或岗位介绍。AI 会将内容分类到完整画像，不确定的部分会留空让你确认。</p><textarea autoFocus rows={12} value={raw} onChange={e=>setRaw(e.target.value)} placeholder={mode==="role"?"例：我在上海一家 80 人的 SaaS 公司做客户成功…":"例：我做了 5 年广告策划，擅长理解客户和整理复杂信息…"}/><div className="parse-note"><span>✦</span><p>演示版会根据标点将内容拆入对应字段；正式版将使用真实语义 AI 解析。</p></div><button className="solid full" disabled={!raw.trim()} onClick={parseText}>AI 分类整理 <span>→</span></button></section></div>}
     {toast&&<div className="toast">{toast}</div>}
