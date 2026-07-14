@@ -64,6 +64,12 @@ export const publicationCycles = sqliteTable("publication_cycles", {
   recreateCount: integer("recreate_count").notNull().default(0),
 }, (table) => [primaryKey({ columns: [table.userId, table.type, table.monthKey] })]);
 
+export const aiParseUsage = sqliteTable("ai_parse_usage", {
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  dayKey: text("day_key").notNull(),
+  requestCount: integer("request_count").notNull().default(0),
+}, (table) => [primaryKey({ columns: [table.userId, table.dayKey] })]);
+
 export const matchRuns = sqliteTable("match_runs", {
   profileId: text("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
   weekKey: text("week_key").notNull(),

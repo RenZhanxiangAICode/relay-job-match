@@ -77,4 +77,11 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(schema, /publicationCycles/);
   assert.match(page, /暂停入池/);
   assert.match(page, /本月已删除过/);
+  assert.match(page, /历史匹配/);
+  assert.match(page, /确定退出当前登录账号吗/);
+  assert.match(page, /\/api\/ai\/parse-profile/);
+  assert.match(worker, /https:\/\/api\.openai\.com\/v1\/responses/);
+  assert.match(worker, /json_schema/);
+  assert.match(worker, /ai_parse_usage/);
+  assert.doesNotMatch(page, /split\(\/\[\\n，。；/);
 });
