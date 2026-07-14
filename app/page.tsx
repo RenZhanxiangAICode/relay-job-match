@@ -66,6 +66,18 @@ const databaseCountLabels: Record<string,string> = {
 
 const formatDatabaseTime = (timestamp:number) => timestamp ? new Date(timestamp*1000).toLocaleString("zh-CN", {hour12:false}) : "—";
 
+function getNextMondayCountdown(now = new Date()) {
+  const nextMonday = new Date(now);
+  const daysUntilMonday = ((8 - now.getDay()) % 7) || 7;
+  nextMonday.setDate(now.getDate() + daysUntilMonday);
+  nextMonday.setHours(0, 0, 0, 0);
+  const remaining = Math.max(0, nextMonday.getTime() - now.getTime());
+  return {
+    days: String(Math.floor(remaining / 86_400_000)).padStart(2, "0"),
+    hours: String(Math.floor((remaining % 86_400_000) / 3_600_000)).padStart(2, "0"),
+  };
+}
+
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
@@ -90,6 +102,7 @@ export default function Home() {
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [adminSummary, setAdminSummary] = useState<{users:number;activeReports:number;pendingAppeals:number}|null>(null);
   const [adminDatabase, setAdminDatabase] = useState<AdminDatabase|null>(null);
+  const [nextMondayCountdown, setNextMondayCountdown] = useState({days:"--",hours:"--"});
   const [dataLoading, setDataLoading] = useState(false);
   const [toast, setToast] = useState("");
   const fields = mode === "role" ? roleFields : talentFields;
@@ -101,6 +114,13 @@ export default function Home() {
       const data = await response.json() as {user?:{email:string;reputation?:number;isAdmin?:boolean}};
       if(data.user){setEmail(data.user.email);setReputation(data.user.reputation??80);setIsAdmin(Boolean(data.user.isAdmin));setLoggedIn(true)}
     }).finally(()=>setAuthChecking(false));
+  },[]);
+
+  useEffect(()=>{
+    const updateCountdown=()=>setNextMondayCountdown(getNextMondayCountdown(new Date()));
+    updateCountdown();
+    const timer=window.setInterval(updateCountdown,30_000);
+    return()=>window.clearInterval(timer);
   },[]);
 
   const refreshDashboard=useCallback(async()=>{
@@ -231,10 +251,9 @@ export default function Home() {
       <header className="topbar"><div><span className="secure-dot"/>匿名模式已开启</div><div><button className="score-pill" onClick={()=>nav("trust")}>信誉 {reputation}</button></div></header>
 
       {view==="home"&&<div className="page home-page">
-        <section className="welcome"><div><span className="overline">GOOD EVENING · RELAY 2716</span><h1>你的下一棒，<br/><em>正在私密池中寻找你。</em></h1><p>完善真实画像，会让 AI 更准确地判断“为什么合适”。</p></div><div className="cycle"><span>下次周筛选</span><b>03<small>天</small> 14<small>时</small></b><p>每周最多 10 条·仅展示 90+ 匹配</p></div></section>
+        <section className="welcome"><div><span className="overline">GOOD EVENING · RELAY 2716</span><h1>你的下一棒，<br/><em>正在私密池中寻找你。</em></h1><p>完善真实画像，会让 AI 更准确地判断“为什么合适”。</p></div><div className="cycle"><span>距离下周一 00:00</span><b>{nextMondayCountdown.days}<small>天</small> {nextMondayCountdown.hours}<small>时</small></b><p>每周最多 10 条·仅展示 90+ 匹配</p></div></section>
         <section className="action-grid"><article className="primary-action"><span className="card-index">01 / PROFILE</span><h2>告诉 AI，你现在需要什么？</h2><div className="role-toggle"><button className={mode==="role"?"active":""} onClick={()=>setMode("role")}>找一位接棒人</button><button className={mode==="talent"?"active":""} onClick={()=>setMode("talent")}>找一个新机会</button></div><p>{mode==="role"?"岗位不会公开。AI 会将真实工作、文化、薪酬、风险和交接方式整理成私密岗位画像。":"简历不会出现姓名和联系方式。AI 会识别你的能力、意愿、底线和可迁移方向。"}</p><div className="completion"><span><b>{completion}%</b> 画像完整度</span><i><b style={{width:`${completion}%`}}/></i></div><div className="action-buttons"><button className="solid" onClick={()=>setProfileOpen(true)}>完整填写 <span>→</span></button><button className="outline" onClick={()=>openAiParser(mode)}>粘贴一段话，AI 帮我拆解</button></div></article>
         <article className="weekly-card"><span className="card-index">02 / WEEKLY MATCH</span><div className="ring"><b>{matchItems.length}</b><small>/ 10</small></div><h3>{!readyForMatching?"发布任意一份画像后开始匹配":matchItems.length?`本周有 ${matchItems.length} 个高匹配机会`:"已入池，暂无 90+ 匹配"}</h3><p>{!readyForMatching?"发布“找工作”或“找接任者”任意一条，系统就会启动对应方向的匹配。":matchItems.length?"只展示来自其他真实用户、且达到 90 分的匿名匹配。":"你的画像已进入私密池，有合适的真实用户时会在这里出现。"}</p><button onClick={()=>nav("matches")}>查看本周筛选 <span>→</span></button></article></section>
-        <section className="principles"><div><span>90+</span><p>关键词达标后再通过向量复核</p></div><div><span>1+1</span><p>每个账号最多一条接棒与一条求职信息</p></div><div><span>@</span><p>第一版仅验证邮箱，其他信息都是自述</p></div><div><span>50%</span><p>陪审成立票过半后按类型自动扣分</p></div></section>
       </div>}
 
       {view==="posts"&&<div className="page posts-page"><div className="page-heading"><div><span className="overline">MY PRIVATE POSTS</span><h1>我的发布</h1><p>两个方向分别管理：每月各可删除一次，删除后各可重新新建一次；暂停和恢复不限次数。</p></div><div className="post-limit"><b>{Object.values(profileMeta).filter(Boolean).length} / 2</b><span>当前有效发布</span></div></div><div className="post-cards">{(["role","talent"] as Mode[]).map(item=>{const profile=profileMeta[item];const limit=publicationLimits[item];return profile?<article key={item}><header><span>{profile.anonymousCode}</span><i>{profile.status==="paused"?"已暂停":"匹配中"}</i></header><h2>{item==="role"?"我的待接棒岗位":"我的找工作画像"}</h2><p>{item==="role"?[profile.payload.city,profile.payload.role,profile.payload.industry].filter(Boolean).join(" · "):[profile.payload.industry,profile.payload.city,profile.payload.salary].filter(Boolean).join(" · ")}</p><div className="post-meta"><span>画像完整度 <b>{profile.completion}%</b></span><span>本周匹配 <b>{matchItems.filter(match=>match.perspective===item).length}</b></span></div><div><button className="solid" onClick={()=>{setMode(item);setProfileOpen(true)}}>{item==="role"?"修改接棒信息":"修改求职信息"}</button><button className="outline" onClick={()=>changeProfileStatus(item,profile.status==="paused"?"pooled":"paused")}>{profile.status==="paused"?"恢复入池":"暂停入池"}</button><button className="danger" disabled={!limit.canDelete} onClick={()=>deleteProfile(item)}>{limit.canDelete?"删除发布":"本月已删除过"}</button></div></article>:<article className="empty-post" key={item}><span className="card-index">{item==="role"?"ROLE POST":"TALENT POST"}</span><h2>{item==="role"?"还没有待接棒岗位":"还没有求职画像"}</h2><p>{limit.canRecreate?(item==="role"?"提交真实岗位信息后，立即进行首次增量匹配。":"提交能力与求职偏好后，立即进行首次增量匹配。"):`该方向本月的新建次数已用完，下月可再次发布。`}</p><button className="solid" disabled={!limit.canRecreate} onClick={()=>{setMode(item);setProfileOpen(true)}}>{limit.canRecreate?"立即发布":"本月不可再新建"}</button></article>})}</div><div className="one-post-rule"><b>匹配什么时候更新？</b><p>首次发布立即匹配；修改、暂停和恢复不会触发即时重算，系统会在下周一按最新内容进行增量匹配。</p></div></div>}

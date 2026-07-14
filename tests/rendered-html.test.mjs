@@ -84,6 +84,9 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /我的项目经验与成果/);
   assert.match(page, /15 天未回复/);
   assert.match(page, /后台数据库/);
+  assert.match(page, /getNextMondayCountdown/);
+  assert.match(page, /距离下周一 00:00/);
+  assert.doesNotMatch(page, /关键词达标后再通过向量复核/);
   assert.match(worker, /\/api\/admin\/database/);
   assert.match(worker, /generativelanguage\.googleapis\.com/);
   assert.match(worker, /responseJsonSchema/);
