@@ -11,12 +11,14 @@ type MatchItem = { id:string; score:number; perspective:Mode; ownDecision:"pendi
 type NotificationItem = { id:string; matchId:string; type:"mutual_match"; anonymousCode:string; score:number };
 type ConversationItem = { id:string; matchId:string; anonymousCode:string; score:number; lastMessage?:string|null; messageCount:number };
 type HistoryItem = { id:string; weekKey:string; score:number; outcome:"success"|"failed"|"ended"; anonymousCode:string; perspective:Mode; reviewAvailable:boolean };
+type AdminDatabase = {counts:Record<string,number>;users:Array<{email:string;reputation:number;status:string;createdAt:number}>;profiles:Array<{anonymousCode:string;type:Mode;status:string;completion:number;email:string;updatedAt:number}>;matches:Array<{score:number;weekKey:string;roleDecision:string;talentDecision:string;roleCode:string;talentCode:string;createdAt:number}>};
 
 const roleFields: Field[] = [
   { key:"city", label:"公司城市", hint:"例：上海·浦东 / 可混合", required:true },
   { key:"role", label:"当前岗位", hint:"职位名称、级别、所属部门", required:true },
   { key:"industry", label:"行业与业务", hint:"公司做什么，岗位服务谁" },
   { key:"work", label:"真实工作内容", hint:"一周怎么过，关键 KPI 是什么", required:true },
+  { key:"projects", label:"岗位项目经验与产出", hint:"这个岗位过去做过哪些项目？目标、职责、规模、结果和可量化产出是什么？", required:true },
   { key:"ability", label:"必要能力", hint:"硬技能、软技能与上手时间", required:true },
   { key:"knowledge", label:"知识与证书", hint:"专业知识、工具、证书或资历要求" },
   { key:"culture", label:"文化氛围", hint:"管理风格、团队关系、决策方式" },
@@ -31,6 +33,7 @@ const roleFields: Field[] = [
 
 const talentFields: Field[] = [
   { key:"ability", label:"我的能力", hint:"你真正擅长什么，有哪些成果", required:true },
+  { key:"projects", label:"我的项目经验与成果", hint:"项目背景、你的角色、采取的行动、可量化结果，以及可以如何验证", required:true },
   { key:"industry", label:"想进入的行业", hint:"可以写多个，也可说为什么" },
   { key:"company", label:"想去的公司", hint:"规模、阶段、团队、管理风格" },
   { key:"reject", label:"明确不接受", hint:"行业、工作内容、加班、出差、管理方式", required:true },
@@ -41,6 +44,27 @@ const talentFields: Field[] = [
   { key:"personality", label:"性格与工作方式", hint:"可粘贴 MBTI / DISC，也可直接描述" },
   { key:"credential", label:"资历与作品", hint:"证书、作品集、项目、可验证人" },
 ];
+
+const reputationRules = [
+  ["+3","合作履约", "双方确认合作成功并完成评价"],
+  ["+1","高质量评价", "对方评价高于 90 分；评价只影响信誉加减分"],
+  ["+1","有效沟通", "同一会话累计 20 次有效回复，最多奖励 1 分；每天最多计 3 次"],
+  ["-1","低质量评价", "对方评价低于 60 分，可申诉"],
+  ["-1","15 天未回复", "从收到待回复消息开始计时，同一会话最多扣 1 分；取消或关闭会话可撤销"],
+  ["-20","虚假岗位或简历", "包括伪造任职、学历、项目经历与项目产出"],
+  ["-100","索要费用或诈骗", "信誉最低降至 0，不封号，但匹配排序与展示机会最低"],
+  ["-10","恶意举报或陪审", "管理员申诉复核确认后扣减；恶意陪审永久失去陪审资格"],
+  ["恢复","申诉翻案", "撤销相应误扣分并重新计算陪审准确率"],
+] as const;
+
+const databaseCountLabels: Record<string,string> = {
+  users:"用户", profiles:"画像", profile_keywords:"画像关键词", matches:"匹配结果",
+  match_runs:"匹配任务", match_exclusions:"永久排除", conversations:"匿名会话", messages:"消息",
+  reputation_events:"信誉变动", reports:"举报", jury_assignments:"陪审分配", jury_votes:"陪审投票",
+  appeals:"申诉", publication_cycles:"发布周期", ai_parse_usage:"AI 解析用量",
+};
+
+const formatDatabaseTime = (timestamp:number) => timestamp ? new Date(timestamp*1000).toLocaleString("zh-CN", {hour12:false}) : "—";
 
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
@@ -58,12 +82,14 @@ export default function Home() {
   const [profileMeta, setProfileMeta] = useState<Record<Mode,ProfileMeta|undefined>>({ role:undefined, talent:undefined });
   const [publicationLimits, setPublicationLimits] = useState<Record<Mode,PublicationLimit>>({role:{canDelete:true,canRecreate:true},talent:{canDelete:true,canRecreate:true}});
   const [isAdmin, setIsAdmin] = useState(false);
+  const [reputation, setReputation] = useState(80);
   const [readyForMatching, setReadyForMatching] = useState(false);
   const [matchItems, setMatchItems] = useState<MatchItem[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [adminSummary, setAdminSummary] = useState<{users:number;activeReports:number;pendingAppeals:number}|null>(null);
+  const [adminDatabase, setAdminDatabase] = useState<AdminDatabase|null>(null);
   const [dataLoading, setDataLoading] = useState(false);
   const [toast, setToast] = useState("");
   const fields = mode === "role" ? roleFields : talentFields;
@@ -72,8 +98,8 @@ export default function Home() {
   useEffect(()=>{
     fetch("/api/auth/me").then(async response=>{
       if(!response.ok) return;
-      const data = await response.json() as {user?:{email:string;isAdmin?:boolean}};
-      if(data.user){setEmail(data.user.email);setIsAdmin(Boolean(data.user.isAdmin));setLoggedIn(true)}
+      const data = await response.json() as {user?:{email:string;reputation?:number;isAdmin?:boolean}};
+      if(data.user){setEmail(data.user.email);setReputation(data.user.reputation??80);setIsAdmin(Boolean(data.user.isAdmin));setLoggedIn(true)}
     }).finally(()=>setAuthChecking(false));
   },[]);
 
@@ -82,14 +108,14 @@ export default function Home() {
     try{
       const response=await fetch("/api/dashboard");
       if(!response.ok) throw new Error("资料读取失败");
-      const data = await response.json() as {user:{email:string;isAdmin:boolean};profiles:Array<{type:Mode;anonymousCode:string;status:string;completion:number;payload:Record<string,string>}>;publicationLimits:Record<Mode,PublicationLimit>;readyForMatching:boolean;matches:MatchItem[];history:HistoryItem[];notifications:NotificationItem[];conversations:ConversationItem[]};
+      const data = await response.json() as {user:{email:string;reputation:number;isAdmin:boolean};profiles:Array<{type:Mode;anonymousCode:string;status:string;completion:number;payload:Record<string,string>}>;publicationLimits:Record<Mode,PublicationLimit>;readyForMatching:boolean;matches:MatchItem[];history:HistoryItem[];notifications:NotificationItem[];conversations:ConversationItem[]};
       const nextValues:Record<string,string> = {};
       const nextMeta:Record<Mode,ProfileMeta|undefined> = {role:undefined,talent:undefined};
       data.profiles.forEach(profile=>{
         nextMeta[profile.type]={anonymousCode:profile.anonymousCode,status:profile.status,completion:profile.completion,payload:profile.payload};
         Object.entries(profile.payload).forEach(([key,value])=>nextValues[`${profile.type}-${key}`]=String(value??""));
       });
-      setEmail(data.user.email);setIsAdmin(data.user.isAdmin);setValues(nextValues);setProfileMeta(nextMeta);
+      setEmail(data.user.email);setReputation(data.user.reputation);setIsAdmin(data.user.isAdmin);setValues(nextValues);setProfileMeta(nextMeta);
       setPublicationLimits(data.publicationLimits);
       setReadyForMatching(data.readyForMatching);setMatchItems(data.matches);setHistoryItems(data.history);setNotifications(data.notifications);setConversations(data.conversations);
     }catch{setToast("资料读取失败，请刷新后重试");setTimeout(()=>setToast(""),2600)}finally{setDataLoading(false)}
@@ -103,9 +129,9 @@ export default function Home() {
 
   useEffect(()=>{
     if(view!=="admin"||!isAdmin) return;
-    fetch("/api/admin/summary").then(async response=>{
-      if(!response.ok) throw new Error();
-      setAdminSummary(await response.json());
+    Promise.all([fetch("/api/admin/summary"),fetch("/api/admin/database")]).then(async([summaryResponse,databaseResponse])=>{
+      if(!summaryResponse.ok||!databaseResponse.ok) throw new Error();
+      setAdminSummary(await summaryResponse.json());setAdminDatabase(await databaseResponse.json());
     }).catch(()=>flash("管理数据读取失败"));
   },[view,isAdmin]);
 
@@ -133,7 +159,7 @@ export default function Home() {
     }catch(error){flash(error instanceof Error?error.message:"保存失败，请稍后再试")}finally{setBusy(false)}
   }
 
-  async function logout(){if(!window.confirm("确定退出当前登录账号吗？"))return;await fetch("/api/auth/logout",{method:"POST"});setLoggedIn(false);setIsAdmin(false);setCodeSent(false);setCode("");setValues({});setRawDrafts({role:"",talent:""});setProfileMeta({role:undefined,talent:undefined});setMatchItems([]);setHistoryItems([]);setNotifications([]);setConversations([]);flash("已安全退出")}
+  async function logout(){if(!window.confirm("确定退出当前登录账号吗？"))return;await fetch("/api/auth/logout",{method:"POST"});setLoggedIn(false);setIsAdmin(false);setReputation(80);setCodeSent(false);setCode("");setValues({});setRawDrafts({role:"",talent:""});setProfileMeta({role:undefined,talent:undefined});setMatchItems([]);setHistoryItems([]);setNotifications([]);setConversations([]);flash("已安全退出")}
   async function changeProfileStatus(type:Mode,status:"paused"|"pooled"){
     const response=await fetch(`/api/profiles/${type}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status})});
     const data=await response.json() as {error?:string};
@@ -202,7 +228,7 @@ export default function Home() {
     </aside>
     <div className="mobile-nav"><button onClick={()=>nav("home")}>首页</button><button onClick={()=>nav("matches")}>匹配</button><button onClick={()=>nav("messages")}>沟通</button><button onClick={()=>nav("jury")}>陪审</button></div>
     <section className="workspace">
-      <header className="topbar"><div><span className="secure-dot"/>匿名模式已开启</div><div><button className="score-pill" onClick={()=>nav("trust")}>信誉 80</button></div></header>
+      <header className="topbar"><div><span className="secure-dot"/>匿名模式已开启</div><div><button className="score-pill" onClick={()=>nav("trust")}>信誉 {reputation}</button></div></header>
 
       {view==="home"&&<div className="page home-page">
         <section className="welcome"><div><span className="overline">GOOD EVENING · RELAY 2716</span><h1>你的下一棒，<br/><em>正在私密池中寻找你。</em></h1><p>完善真实画像，会让 AI 更准确地判断“为什么合适”。</p></div><div className="cycle"><span>下次周筛选</span><b>03<small>天</small> 14<small>时</small></b><p>每周最多 10 条·仅展示 90+ 匹配</p></div></section>
@@ -221,11 +247,11 @@ export default function Home() {
 
       {view==="notifications"&&<div className="page notifications-page"><div className="page-heading"><div><span className="overline">MATCH NOTIFICATIONS</span><h1>通知</h1><p>匹配、沟通和账号安全的真实通知会出现在这里。</p></div></div>{notifications.length===0?<div className="empty-state"><span>✓</span><h2>暂无新通知</h2><p>双方匹配成功后，你会在这里收到开始匿名沟通的邀请。</p></div>:<div className="notification-list">{notifications.map(item=><article key={item.id}><span>✦</span><div><h2>你已经成功匹配</h2><p>你和匿名用户 {item.anonymousCode} 都选择了“想了解”，匹配度 {item.score} 分。是否开始匿名沟通？</p></div><button className="solid" onClick={()=>startConversation(item.matchId)}>开始匿名沟通</button></article>)}</div>}</div>}
 
-      {view==="trust"&&<div className="page trust-page"><div className="page-heading"><div><span className="overline">TRUST PASSPORT</span><h1>信誉记录</h1><p>第一版只验证邮箱归属，其他岗位与简历信息都是本人自述。</p></div><div className="trust-score"><b>80</b><span>新账号初始信誉</span></div></div><div className="trust-layout"><section className="passport"><header><div className="avatar">R</div><div><h2>{profileMeta.talent?.anonymousCode||profileMeta.role?.anonymousCode||"新匿名用户"}</h2><p>邮箱已验证</p></div><span className="level">邮箱验证</span></header>{[["邮箱归属","verified","邮箱验证码已通过"],["任职与学历","self","平台暂不认证"],["项目成果","self","平台暂不认证"],["专业能力","self","平台暂不认证"],["内推与 HC 权限","self","平台暂不认证"],["社区履约记录","record","暂无记录"]].map(x=><div className="passport-row" key={x[0]}><div><b>{x[0]}</b><small>{x[2]}</small></div><span className={x[1]}>{x[1]==="verified"?"已验证":x[1]==="record"?"平台记录":"本人自述"}</span></div>)}</section><aside className="reputation"><h3>信誉奖惩规则</h3><p>初始 80 分，最高 100 分。只有 100 分用户才会被随机抽中陪审。</p><div className="rep-item"><span>+3</span><div><b>有效履约</b><small>匹配后诚信沟通并完成双向评价</small></div></div><div className="rep-item negative"><span>-20</span><div><b>证实虚假岗位或简历</b><small>伪造任职、学历或项目成果</small></div></div><div className="rep-item negative"><span>-100</span><div><b>索要费用或欺诈</b><small>信誉降至 0，匹配权重与展示机会最低</small></div></div><div className="rep-item negative"><span>-10</span><div><b>恶意举报或陪审</b><small>申诉复核确认后扣减</small></div></div></aside></div></div>}
+      {view==="trust"&&<div className="page trust-page"><div className="page-heading"><div><span className="overline">TRUST PASSPORT</span><h1>信誉记录</h1><p>第一版只验证邮箱归属，其他岗位与简历信息都是本人自述。</p></div><div className="trust-score"><b>{reputation}</b><span>当前信誉分</span></div></div><div className="trust-layout"><section className="passport"><header><div className="avatar">R</div><div><h2>{profileMeta.talent?.anonymousCode||profileMeta.role?.anonymousCode||"新匿名用户"}</h2><p>邮箱已验证</p></div><span className="level">邮箱验证</span></header>{[["邮箱归属","verified","邮箱验证码已通过"],["任职与学历","self","平台暂不认证"],["项目成果","self","平台暂不认证"],["专业能力","self","平台暂不认证"],["内推与 HC 权限","self","平台暂不认证"],["社区履约记录","record","暂无记录"]].map(x=><div className="passport-row" key={x[0]}><div><b>{x[0]}</b><small>{x[2]}</small></div><span className={x[1]}>{x[1]==="verified"?"已验证":x[1]==="record"?"平台记录":"本人自述"}</span></div>)}</section><aside className="reputation"><h3>信誉奖惩规则</h3><p>初始 80 分，最高 100 分。只有 100 分用户才会被随机抽中陪审。</p>{reputationRules.map(rule=><div className={`rep-item ${rule[0].startsWith("-")?"negative":rule[0]==="恢复"?"neutral":""}`} key={`${rule[0]}-${rule[1]}`}><span>{rule[0]}</span><div><b>{rule[1]}</b><small>{rule[2]}</small></div></div>)}<div className="reputation-note"><b>0 分账号不会封号</b><p>仍可使用和申诉，但匹配排序最低、每周展示机会更少、卡片显示“低信誉”，且不能参加陪审。普通信誉下降恢复至 100 分后可重新获得陪审资格；确认恶意陪审者永久失去资格。</p></div></aside></div></div>}
 
-      {view==="jury"&&<div className="page jury-page"><div className="page-heading"><div><span className="overline">COMMUNITY JURY</span><h1>公民陪审</h1><p>案件只会随机发给当时信誉度为 100 分的陪审员。</p></div><div className="jury-duty"><b>你的信誉：80</b><span>达到 100 分后才可能被随机抽中</span></div></div><div className="empty-state"><span>⚖</span><h2>当前没有分配给你的陪审案件</h2><p>新账号不会看到演示案件或虚假排行数据。真实案件会按规则随机发放。</p></div></div>}
+      {view==="jury"&&<div className="page jury-page"><div className="page-heading"><div><span className="overline">COMMUNITY JURY</span><h1>公民陪审</h1><p>案件只会随机发给当时信誉度为 100 分的陪审员。</p></div><div className="jury-duty"><b>你的信誉：{reputation}</b><span>{reputation===100?"你已具备被随机抽中的资格":"达到 100 分后才可能被随机抽中"}</span></div></div><div className="empty-state"><span>⚖</span><h2>当前没有分配给你的陪审案件</h2><p>新账号不会看到演示案件或虚假排行数据。真实案件会按规则随机发放。</p></div></div>}
 
-      {view==="admin"&&isAdmin&&<div className="page admin-page"><div className="page-heading"><div><span className="overline">ADMIN ONLY</span><h1>管理员控制台</h1><p>该页面只对唯一管理员账号显示，同时由服务端校验权限。</p></div></div><div className="admin-stats">{[[String(adminSummary?.users??0),"注册用户"],[String(adminSummary?.activeReports??0),"陪审中举报"],[String(adminSummary?.pendingAppeals??0),"待处理申诉"]].map(x=><div key={x[1]}><b>{x[0]}</b><span>{x[1]}</span></div>)}</div><div className="empty-state"><span>✓</span><h2>当前没有待处理的真实队列</h2><p>管理员页面不再展示演示申诉、虚假封号数或测试陪审员。</p></div></div>}
+      {view==="admin"&&isAdmin&&<div className="page admin-page"><div className="page-heading"><div><span className="overline">ADMIN ONLY</span><h1>管理员控制台</h1><p>该页面只对唯一管理员账号显示，同时由服务端校验权限。</p></div></div><div className="admin-stats">{[[String(adminSummary?.users??0),"注册用户"],[String(adminDatabase?.counts.profiles??0),"真实画像"],[String(adminSummary?.activeReports??0),"陪审中举报"],[String(adminSummary?.pendingAppeals??0),"待处理申诉"]].map(x=><div key={x[1]}><b>{x[0]}</b><span>{x[1]}</span></div>)}</div><section className="database-panel"><header><div><span className="overline">LIVE DATABASE</span><h2>后台数据库</h2></div><p>以下数据直接读取线上数据库，仅供管理员查看；不会展示验证码、登录会话、密钥或完整画像正文。</p></header>{!adminDatabase?<div className="database-loading">正在读取数据库…</div>:<><div className="database-counts">{Object.entries(adminDatabase.counts).map(([key,value])=><div key={key}><b>{value}</b><span>{databaseCountLabels[key]||key}</span></div>)}</div><div className="database-section"><h3>最近用户</h3>{adminDatabase.users.length===0?<p className="database-empty">暂无用户</p>:<div className="database-table users"><div className="database-head"><span>邮箱</span><span>信誉</span><span>状态</span><span>注册时间</span></div>{adminDatabase.users.map(user=><div className="database-row" key={`${user.email}-${user.createdAt}`}><span>{user.email}</span><b>{user.reputation}</b><span>{user.status}</span><time>{formatDatabaseTime(user.createdAt)}</time></div>)}</div>}</div><div className="database-section"><h3>最近画像</h3>{adminDatabase.profiles.length===0?<p className="database-empty">暂无画像</p>:<div className="database-table profiles"><div className="database-head"><span>匿名编号</span><span>方向</span><span>状态 / 完整度</span><span>用户</span><span>更新时间</span></div>{adminDatabase.profiles.map(profile=><div className="database-row" key={`${profile.anonymousCode}-${profile.type}`}><b>{profile.anonymousCode}</b><span>{profile.type==="role"?"找接任者":"找工作"}</span><span>{profile.status} · {profile.completion}%</span><span>{profile.email}</span><time>{formatDatabaseTime(profile.updatedAt)}</time></div>)}</div>}</div><div className="database-section"><h3>最近匹配</h3>{adminDatabase.matches.length===0?<p className="database-empty">暂无匹配结果</p>:<div className="database-table matches"><div className="database-head"><span>双方匿名编号</span><span>匹配分</span><span>周次</span><span>双方状态</span><span>生成时间</span></div>{adminDatabase.matches.map((match,index)=><div className="database-row" key={`${match.roleCode}-${match.talentCode}-${match.createdAt}-${index}`}><b>{match.roleCode} ↔ {match.talentCode}</b><span>{match.score}</span><span>{match.weekKey}</span><span>{match.roleDecision} / {match.talentDecision}</span><time>{formatDatabaseTime(match.createdAt)}</time></div>)}</div>}</div></>}</section></div>}
     </section>
 
     {profileOpen&&<div className="drawer-backdrop" onClick={()=>setProfileOpen(false)}><section className="profile-drawer" onClick={e=>e.stopPropagation()}><header><div><span className="overline">PRIVATE PROFILE · 1 / 1</span><h2>{mode==="role"?"修改待接棒岗位":"修改找工作画像"}</h2><p>{mode==="role"?"每个账号只有一条待接棒岗位，保存后会更新原记录。":"每个账号只有一条求职画像，保存后会更新原记录。"}</p></div><button onClick={()=>setProfileOpen(false)}>×</button></header><div className="contact-lock"><div><b>已验证登录邮箱</b><span>只用于登录和账号通知，不对匹配对象展示</span></div><div className="contact-grid one"><label>邮箱<input type="email" value={email} readOnly/></label></div></div><div className="field-grid">{fields.map(f=><label key={f.key}><span>{f.label}{f.required&&<i>必填</i>}</span><textarea rows={3} placeholder={f.hint} value={values[`${mode}-${f.key}`]||""} onChange={e=>setValues(v=>({...v,[`${mode}-${f.key}`]:e.target.value}))}/></label>)}</div><footer><div><b>{completion}%</b><span>画像完整度</span></div><button className="outline" onClick={()=>openAiParser(mode)}>AI 帮我补齐</button><button className="solid" disabled={busy} onClick={saveProfile}>{busy?"正在保存…":profileMeta[mode]?"保存真实修改":"确认并匿名入池"}</button></footer></section></div>}

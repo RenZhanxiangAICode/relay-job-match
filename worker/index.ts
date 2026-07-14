@@ -30,8 +30,8 @@ const SESSION_COOKIE = "relay_session";
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
 const CODE_SECONDS = 10 * 60;
 const PROFILE_FIELDS = {
-  role: ["city", "role", "industry", "work", "ability", "knowledge", "culture", "system", "travel", "growth", "referral", "process", "warning", "leave"],
-  talent: ["ability", "industry", "company", "reject", "city", "salary", "arrival", "plan", "personality", "credential"],
+  role: ["city", "role", "industry", "work", "projects", "ability", "knowledge", "culture", "system", "travel", "growth", "referral", "process", "warning", "leave"],
+  talent: ["ability", "projects", "industry", "company", "reject", "city", "salary", "arrival", "plan", "personality", "credential"],
 } as const;
 
 function json(data: unknown, status = 200, headers?: HeadersInit) {
@@ -86,7 +86,7 @@ function tokenize(value: unknown) {
 }
 
 function buildProfileIndex(payload: Record<string, unknown>) {
-  const important = new Set(["city", "role", "industry", "ability", "knowledge", "credential", "salary", "system"]);
+  const important = new Set(["city", "role", "industry", "ability", "projects", "knowledge", "credential", "salary", "system"]);
   const weighted = new Map<string, number>();
   for (const [key, value] of Object.entries(payload)) {
     for (const token of tokenize(value)) weighted.set(token, Math.max(weighted.get(token) ?? 0, important.has(key) ? 3 : 1));
@@ -713,6 +713,42 @@ async function adminSummaryApi(request: Request, env: Env) {
   return json({ users: users?.count ?? 0, activeReports: reports?.count ?? 0, pendingAppeals: appeals?.count ?? 0 });
 }
 
+async function adminDatabaseApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!isAdmin(env, auth.user.email)) return json({ error: "无管理员权限" }, 403);
+  const tableNames = [
+    "users", "profiles", "profile_keywords", "matches", "match_runs", "match_exclusions",
+    "conversations", "messages", "reputation_events", "reports", "jury_assignments", "jury_votes",
+    "appeals", "publication_cycles", "ai_parse_usage",
+  ] as const;
+  const countValues = await Promise.all(tableNames.map((table) =>
+    env.DB.prepare(`SELECT COUNT(*) AS count FROM ${table}`).first<{ count: number }>()));
+  const counts = Object.fromEntries(tableNames.map((table, index) => [table, countValues[index]?.count ?? 0]));
+  const [users, profiles, matches] = await Promise.all([
+    env.DB.prepare(`
+      SELECT email, reputation, status, created_at AS createdAt
+      FROM users ORDER BY created_at DESC LIMIT 30
+    `).all<{ email: string; reputation: number; status: string; createdAt: number }>(),
+    env.DB.prepare(`
+      SELECT p.anonymous_code AS anonymousCode, p.type, p.status, p.completion,
+        u.email, p.updated_at AS updatedAt
+      FROM profiles p JOIN users u ON u.id = p.user_id
+      ORDER BY p.updated_at DESC LIMIT 30
+    `).all<{ anonymousCode: string; type: string; status: string; completion: number; email: string; updatedAt: number }>(),
+    env.DB.prepare(`
+      SELECT m.score, m.week_key AS weekKey, m.role_decision AS roleDecision,
+        m.talent_decision AS talentDecision, rp.anonymous_code AS roleCode,
+        tp.anonymous_code AS talentCode, m.created_at AS createdAt
+      FROM matches m
+      JOIN profiles rp ON rp.id = m.role_profile_id
+      JOIN profiles tp ON tp.id = m.talent_profile_id
+      ORDER BY m.created_at DESC LIMIT 30
+    `).all<Record<string, string | number>>(),
+  ]);
+  return json({ counts, users: users.results, profiles: profiles.results, matches: matches.results });
+}
+
 async function api(request: Request, env: Env) {
   const { pathname } = new URL(request.url);
   if (pathname === "/api/auth/request-code" && request.method === "POST") return requestCode(request, env);
@@ -733,6 +769,7 @@ async function api(request: Request, env: Env) {
   if (decisionMatch && request.method === "PUT") return matchDecisionApi(request, env, decisionMatch[1]);
   if (pathname === "/api/conversations" && request.method === "POST") return startConversationApi(request, env);
   if (pathname === "/api/admin/summary" && request.method === "GET") return adminSummaryApi(request, env);
+  if (pathname === "/api/admin/database" && request.method === "GET") return adminDatabaseApi(request, env);
   return json({ error: "接口不存在" }, 404);
 }
 

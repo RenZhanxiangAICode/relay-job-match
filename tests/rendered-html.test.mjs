@@ -80,6 +80,11 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /历史匹配/);
   assert.match(page, /确定退出当前登录账号吗/);
   assert.match(page, /\/api\/ai\/parse-profile/);
+  assert.match(page, /岗位项目经验与产出/);
+  assert.match(page, /我的项目经验与成果/);
+  assert.match(page, /15 天未回复/);
+  assert.match(page, /后台数据库/);
+  assert.match(worker, /\/api\/admin\/database/);
   assert.match(worker, /generativelanguage\.googleapis\.com/);
   assert.match(worker, /responseJsonSchema/);
   assert.match(worker, /ai_parse_usage/);
