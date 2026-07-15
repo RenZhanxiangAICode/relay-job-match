@@ -133,6 +133,9 @@ export const adminMatchRefreshes = sqliteTable("admin_match_refreshes", {
 export const conversations = sqliteTable("conversations", {
   id: text("id").primaryKey(),
   matchId: text("match_id").notNull().references(() => matches.id, { onDelete: "cascade" }),
+  status: text("status", { enum: ["active", "cancelled", "success_pending", "successful"] }).notNull().default("active"),
+  successRequestedBy: text("success_requested_by").references(() => users.id),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("conversations_match_unique").on(table.matchId)]);
 
@@ -143,6 +146,35 @@ export const messages = sqliteTable("messages", {
   body: text("body").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [index("messages_conversation_time_idx").on(table.conversationId, table.createdAt)]);
+
+export const notifications = sqliteTable("notifications", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  type: text("type", { enum: ["matches_ready", "mutual_match", "new_message", "match_cancelled", "success_request", "success_confirmed", "report", "jury", "reputation", "appeal"] }).notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+  targetId: text("target_id"),
+  dedupeKey: text("dedupe_key").notNull(),
+  readAt: integer("read_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [
+  uniqueIndex("notifications_dedupe_unique").on(table.dedupeKey),
+  index("notifications_user_time_idx").on(table.userId, table.createdAt),
+]);
+
+export const reviews = sqliteTable("reviews", {
+  id: text("id").primaryKey(),
+  conversationId: text("conversation_id").notNull().references(() => conversations.id, { onDelete: "cascade" }),
+  reviewerId: text("reviewer_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  truthfulness: integer("truthfulness").notNull(),
+  attitude: integer("attitude").notNull(),
+  responsiveness: integer("responsiveness").notNull(),
+  professionalism: integer("professionalism").notNull(),
+  fulfillment: integer("fulfillment").notNull(),
+  comment: text("comment").notNull().default(""),
+  followup: text("followup"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [uniqueIndex("reviews_conversation_reviewer_unique").on(table.conversationId, table.reviewerId)]);
 
 export const reputationEvents = sqliteTable("reputation_events", {
   id: text("id").primaryKey(),

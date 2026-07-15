@@ -496,6 +496,7 @@ async function ensureDailyMatchesForUser(env: Env, userId: string) {
   const profiles = await env.DB.prepare(`
     SELECT id, type, payload, search_text AS searchText FROM profiles WHERE user_id = ? AND status = 'pooled'
   `).bind(userId).all<{ id: string; type: "role" | "talent"; payload: string; searchText: string }>();
+  let generated = 0;
   for (const profile of profiles.results) {
     if (!profile.searchText) {
       const index = buildProfileIndex(JSON.parse(profile.payload));
@@ -503,8 +504,10 @@ async function ensureDailyMatchesForUser(env: Env, userId: string) {
         .bind(index.searchText, JSON.stringify(vectorize(index.searchText)), profile.id).run();
       await syncProfileIndex(env, profile.id, profile.type, index.keywords);
     }
-    await runMatchForProfile(env, profile.id);
+    const result = await runMatchForProfile(env, profile.id);
+    generated += result.matches;
   }
+  if (generated > 0) await createNotification(env, { userId, type: "matches_ready", title: "今日匹配结果已生成", body: `系统为你的有效画像更新了 ${generated} 条候选结果，请查看匹配原因与风险。`, dedupeKey: `matches:${currentCycle}:${userId}` });
 }
 
 async function parseProfileWithAi(request: Request, env: Env) {
@@ -586,8 +589,13 @@ async function profilesApi(request: Request, env: Env) {
   const body = await requestBody(request);
   const type = body?.type === "role" || body?.type === "talent" ? body.type : null;
   const payload = body?.payload && typeof body.payload === "object" && !Array.isArray(body.payload) ? body.payload : null;
+  const publish = body?.publish !== false;
   const completion = typeof body?.completion === "number" ? Math.max(0, Math.min(100, Math.round(body.completion))) : 0;
   if (!type || !payload) return json({ error: "发布内容格式不正确" }, 400);
+  const requiredFields = type === "role" ? ["experience", "education", "projects", "ability", "work"] : ["experience", "education", "projects", "ability"];
+  if (publish && requiredFields.some((field) => !String((payload as Record<string, unknown>)[field] ?? "").trim())) {
+    return json({ error: "入池前请补齐经验、教育、项目产出和能力等必要信息" }, 400);
+  }
   const serialized = JSON.stringify(payload);
   if (serialized.length > 30000) return json({ error: "发布内容过长" }, 413);
 
@@ -611,15 +619,16 @@ async function profilesApi(request: Request, env: Env) {
   const index = buildProfileIndex(payload);
   const embedding = vectorize(index.searchText);
   const contentVersion = (current?.contentVersion ?? 0) + 1;
+  const nextStatus = publish ? "pooled" : "draft";
   await env.DB.prepare(`
     INSERT INTO profiles (id, user_id, type, anonymous_code, payload, search_text, embedding, content_version, completion, status, created_at, updated_at, deleted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pooled', ?, ?, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(user_id, type) DO UPDATE SET anonymous_code = excluded.anonymous_code, payload = excluded.payload,
       search_text = excluded.search_text, embedding = excluded.embedding, content_version = excluded.content_version,
-      completion = excluded.completion, status = 'pooled', updated_at = excluded.updated_at, deleted_at = NULL
-  `).bind(id, auth.user.id, type, anonymousCode, serialized, index.searchText, JSON.stringify(embedding), contentVersion, completion, now, now).run();
+      completion = excluded.completion, status = excluded.status, updated_at = excluded.updated_at, deleted_at = NULL
+  `).bind(id, auth.user.id, type, anonymousCode, serialized, index.searchText, JSON.stringify(embedding), contentVersion, completion, nextStatus, now, now).run();
   await syncProfileIndex(env, id, type, index.keywords);
-  if (!current || recreating) {
+  if (publish && (!current || recreating || current.status === "draft")) {
     if (recreating) {
       await env.DB.prepare(`
         DELETE FROM matches WHERE week_key = ?
@@ -629,7 +638,7 @@ async function profilesApi(request: Request, env: Env) {
     }
     await runMatchForProfile(env, id, true);
   }
-  return json({ ok: true, profile: { id, type, anonymousCode, payload, completion, status: "pooled", updatedAt: now } });
+  return json({ ok: true, profile: { id, type, anonymousCode, payload, completion, status: nextStatus, updatedAt: now } });
 }
 
 async function profileLifecycleApi(request: Request, env: Env, type: "role" | "talent") {
@@ -663,6 +672,13 @@ async function profileLifecycleApi(request: Request, env: Env, type: "role" | "t
     return json({ ok: true, status });
   }
   return json({ error: "不支持的请求" }, 405);
+}
+
+async function createNotification(env: Env, input: { userId: string; type: string; title: string; body: string; targetId?: string | null; dedupeKey: string }) {
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO notifications (id, user_id, type, title, body, target_id, dedupe_key, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(crypto.randomUUID(), input.userId, input.type, input.title, input.body, input.targetId ?? null, input.dedupeKey, Math.floor(Date.now() / 1000)).run();
 }
 
 async function dashboardApi(request: Request, env: Env) {
@@ -709,12 +725,13 @@ async function dashboardApi(request: Request, env: Env) {
     ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
     ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
   ].sort((a, b) => Number(b.score) - Number(a.score));
-  const notifications = matches
-    .filter((match) => match.ownDecision === "interested" && match.otherDecision === "interested")
-    .map((match) => ({ id: `mutual-${match.id}`, matchId: match.id, type: "mutual_match", anonymousCode: match.anonymousCode, score: match.score }));
+  const notificationRows = await env.DB.prepare(`
+    SELECT id, type, title, body, target_id AS targetId, read_at AS readAt, created_at AS createdAt
+    FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
+  `).bind(auth.user.id).all<Record<string, string | number | null>>();
 
   const conversations = await env.DB.prepare(`
-    SELECT c.id, c.match_id AS matchId,
+    SELECT c.id, c.match_id AS matchId, c.status,
       CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
       m.score,
       (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
@@ -765,7 +782,13 @@ async function dashboardApi(request: Request, env: Env) {
 
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, publicationLimits, readyForMatching, matches, history, notifications, conversations: conversations.results,
+    profiles: profileRows, publicationLimits, readyForMatching, matches, history, notifications: notificationRows.results, conversations: conversations.results,
+    matchingStats: {
+      role: matches.filter((match) => match.perspective === "role").length,
+      talent: matches.filter((match) => match.perspective === "talent").length,
+      highScore: matches.filter((match) => Number(match.score) >= 90).length,
+      mutual: matches.filter((match) => match.ownDecision === "interested" && match.otherDecision === "interested").length,
+    },
   });
 }
 
@@ -779,10 +802,11 @@ async function matchDecisionApi(request: Request, env: Env, matchId: string) {
   if (!decision) return json({ error: "选择无效" }, 400);
   const match = await env.DB.prepare(`
     SELECT rp.user_id AS roleUserId, tp.user_id AS talentUserId,
+      rp.anonymous_code AS roleCode, tp.anonymous_code AS talentCode, m.score,
       m.role_decision AS roleDecision, m.talent_decision AS talentDecision
     FROM matches m JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
     WHERE m.id = ?
-  `).bind(matchId).first<{ roleUserId: string; talentUserId: string; roleDecision: string; talentDecision: string }>();
+  `).bind(matchId).first<{ roleUserId: string; talentUserId: string; roleCode: string; talentCode: string; score: number; roleDecision: string; talentDecision: string }>();
   if (!match || (match.roleUserId !== auth.user.id && match.talentUserId !== auth.user.id)) return json({ error: "匹配不存在" }, 404);
   const column = match.roleUserId === auth.user.id ? "role_decision" : "talent_decision";
   await env.DB.prepare(`UPDATE matches SET ${column} = ? WHERE id = ?`).bind(decision, matchId).run();
@@ -798,8 +822,13 @@ async function matchDecisionApi(request: Request, env: Env, matchId: string) {
   if (updated?.roleDecision === "interested" && updated.talentDecision === "interested") {
     const existing = await env.DB.prepare("SELECT id FROM conversations WHERE match_id = ?").bind(matchId).first<{ id: string }>();
     conversationId = existing?.id ?? crypto.randomUUID();
-    if (!existing) await env.DB.prepare("INSERT INTO conversations (id, match_id, created_at) VALUES (?, ?, ?)")
-      .bind(conversationId, matchId, Math.floor(Date.now() / 1000)).run();
+    const now = Math.floor(Date.now() / 1000);
+    if (!existing) await env.DB.prepare("INSERT INTO conversations (id, match_id, status, updated_at, created_at) VALUES (?, ?, 'active', ?, ?)")
+      .bind(conversationId, matchId, now, now).run();
+    await Promise.all([
+      createNotification(env, { userId: match.roleUserId, type: "mutual_match", title: "双方都想进一步了解", body: `你与匿名候选人 ${match.talentCode} 的匹配度为 ${match.score} 分，匿名沟通已经开启。`, targetId: conversationId, dedupeKey: `mutual:${matchId}:${match.roleUserId}` }),
+      createNotification(env, { userId: match.talentUserId, type: "mutual_match", title: "双方都想进一步了解", body: `你与匿名岗位 ${match.roleCode} 的匹配度为 ${match.score} 分，匿名沟通已经开启。`, targetId: conversationId, dedupeKey: `mutual:${matchId}:${match.talentUserId}` }),
+    ]);
   }
   return json({ ok: true, conversationId });
 }
@@ -842,9 +871,86 @@ async function startConversationApi(request: Request, env: Env) {
   if (match.roleDecision !== "interested" || match.talentDecision !== "interested") return json({ error: "只有双方匹配成功后才能开始沟通" }, 409);
   const existing = await env.DB.prepare("SELECT id FROM conversations WHERE match_id = ?").bind(matchId).first<{ id: string }>();
   const id = existing?.id ?? crypto.randomUUID();
-  if (!existing) await env.DB.prepare("INSERT INTO conversations (id, match_id, created_at) VALUES (?, ?, ?)")
-    .bind(id, matchId, Math.floor(Date.now() / 1000)).run();
+  if (!existing) {
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare("INSERT INTO conversations (id, match_id, status, updated_at, created_at) VALUES (?, ?, 'active', ?, ?)")
+      .bind(id, matchId, now, now).run();
+  }
   return json({ ok: true, conversationId: id });
+}
+
+async function conversationContext(env: Env, conversationId: string, userId: string) {
+  return env.DB.prepare(`
+    SELECT c.id, c.status, c.success_requested_by AS successRequestedBy, m.id AS matchId, m.score,
+      rp.user_id AS roleUserId, tp.user_id AS talentUserId,
+      CASE WHEN rp.user_id = ? THEN tp.user_id ELSE rp.user_id END AS otherUserId,
+      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode
+    FROM conversations c JOIN matches m ON m.id = c.match_id
+    JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE c.id = ? AND (rp.user_id = ? OR tp.user_id = ?)
+  `).bind(userId, userId, conversationId, userId, userId).first<Record<string, string | number | null>>();
+}
+
+async function conversationMessagesApi(request: Request, env: Env, conversationId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  const context = await conversationContext(env, conversationId, auth.user.id);
+  if (!context) return json({ error: "会话不存在" }, 404);
+  if (request.method === "GET") {
+    const rows = await env.DB.prepare(`SELECT id, sender_id AS senderId, body, created_at AS createdAt FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500`)
+      .bind(conversationId).all<Record<string, string | number>>();
+    return json({ conversation: { id: conversationId, status: context.status, anonymousCode: context.anonymousCode, score: context.score, successRequestedByMe: context.successRequestedBy === auth.user.id }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
+  }
+  if (request.method !== "POST") return json({ error: "不支持的请求" }, 405);
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  if (context.status !== "active" && context.status !== "success_pending") return json({ error: "会话已经关闭" }, 409);
+  const body = await requestBody(request);
+  const message = typeof body?.body === "string" ? body.body.trim() : "";
+  if (!message || message.length > 2000) return json({ error: "消息应为 1—2000 个字符" }, 400);
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO messages (id, conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?, ?)").bind(id, conversationId, auth.user.id, message, now),
+    env.DB.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").bind(now, conversationId),
+  ]);
+  await createNotification(env, { userId: String(context.otherUserId), type: "new_message", title: `收到匿名用户 ${context.anonymousCode} 的新消息`, body: message.slice(0, 120), targetId: conversationId, dedupeKey: `message:${id}` });
+  const warning = /(转账|保证金|培训费|押金|手续费|汇款|先付款|付费内推)/.test(message) ? "请勿在核实身份与岗位前转账或支付任何费用。" : null;
+  return json({ ok: true, message: { id, body: message, mine: true, createdAt: now }, warning });
+}
+
+async function conversationActionApi(request: Request, env: Env, conversationId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  const context = await conversationContext(env, conversationId, auth.user.id);
+  if (!context) return json({ error: "会话不存在" }, 404);
+  const body = await requestBody(request);
+  const action = body?.action;
+  const now = Math.floor(Date.now() / 1000);
+  if (action === "cancel") {
+    await env.DB.prepare("UPDATE conversations SET status = 'cancelled', updated_at = ? WHERE id = ?").bind(now, conversationId).run();
+    await createNotification(env, { userId: String(context.otherUserId), type: "match_cancelled", title: "对方已取消匹配", body: "本次匿名沟通已经结束，取消本身不会影响双方信誉。", targetId: conversationId, dedupeKey: `cancel:${conversationId}` });
+    return json({ ok: true, status: "cancelled" });
+  }
+  if (action === "success") {
+    if (context.successRequestedBy && context.successRequestedBy !== auth.user.id) {
+      await env.DB.prepare("UPDATE conversations SET status = 'successful', updated_at = ? WHERE id = ?").bind(now, conversationId).run();
+      await createNotification(env, { userId: String(context.otherUserId), type: "success_confirmed", title: "双方已确认合作成功", body: "本次匹配已进入成功历史，现在可以完成匿名评价。", targetId: conversationId, dedupeKey: `success-confirmed:${conversationId}:${context.otherUserId}` });
+      return json({ ok: true, status: "successful" });
+    }
+    await env.DB.prepare("UPDATE conversations SET status = 'success_pending', success_requested_by = ?, updated_at = ? WHERE id = ?").bind(auth.user.id, now, conversationId).run();
+    await createNotification(env, { userId: String(context.otherUserId), type: "success_request", title: "对方发起合作成功确认", body: "请确认这次匹配是否已经产生双方认可的结果。", targetId: conversationId, dedupeKey: `success-request:${conversationId}` });
+    return json({ ok: true, status: "success_pending" });
+  }
+  return json({ error: "操作无效" }, 400);
+}
+
+async function notificationsApi(request: Request, env: Env, notificationId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  await env.DB.prepare("UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ?").bind(Math.floor(Date.now() / 1000), notificationId, auth.user.id).run();
+  return json({ ok: true });
 }
 
 async function adminSummaryApi(request: Request, env: Env) {
@@ -867,7 +973,7 @@ async function adminDatabaseApi(request: Request, env: Env) {
     "users", "profiles", "profile_keywords", "matches", "match_runs", "match_exclusions",
     "conversations", "messages", "reputation_events", "reports", "jury_assignments", "jury_votes",
     "appeals", "publication_cycles", "ai_parse_usage",
-    "match_feedback", "admin_match_refreshes",
+    "match_feedback", "admin_match_refreshes", "notifications", "reviews",
   ] as const;
   const countValues = await Promise.all(tableNames.map((table) =>
     env.DB.prepare(`SELECT COUNT(*) AS count FROM ${table}`).first<{ count: number }>()));
@@ -965,6 +1071,12 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   const favoriteMatch = pathname.match(/^\/api\/matches\/([^/]+)\/favorite$/);
   if (favoriteMatch && request.method === "PUT") return matchFavoriteApi(request, env, favoriteMatch[1]);
   if (pathname === "/api/conversations" && request.method === "POST") return startConversationApi(request, env);
+  const conversationMessagesMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+  if (conversationMessagesMatch && (request.method === "GET" || request.method === "POST")) return conversationMessagesApi(request, env, conversationMessagesMatch[1]);
+  const conversationActionMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/action$/);
+  if (conversationActionMatch && request.method === "POST") return conversationActionApi(request, env, conversationActionMatch[1]);
+  const notificationMatch = pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (notificationMatch && request.method === "PUT") return notificationsApi(request, env, notificationMatch[1]);
   if (pathname === "/api/admin/summary" && request.method === "GET") return adminSummaryApi(request, env);
   if (pathname === "/api/admin/database" && request.method === "GET") return adminDatabaseApi(request, env);
   if (pathname === "/api/admin/matches/refresh") return adminMatchRefreshApi(request, env, ctx);

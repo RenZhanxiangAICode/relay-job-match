@@ -103,3 +103,22 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(worker, /ai_parse_usage/);
   assert.doesNotMatch(page, /split\(\/\[\\n，。；/);
 });
+
+test("ships the user-centered onboarding, persistent notifications, and real chat", async () => {
+  const [page, worker, schema] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /你今天想解决什么/);
+  assert.match(page, /AI PRIVATE INTERVIEW/);
+  assert.match(page, /保存草稿/);
+  assert.match(page, /NEXT BEST ACTION/);
+  assert.match(page, /sendMessage/);
+  assert.match(page, /未读与已读都会永久保留/);
+  assert.match(worker, /INSERT OR IGNORE INTO notifications/);
+  assert.match(worker, /conversationMessagesApi/);
+  assert.match(worker, /转账\|保证金\|培训费/);
+  assert.match(schema, /export const notifications/);
+  assert.match(schema, /export const reviews/);
+});
