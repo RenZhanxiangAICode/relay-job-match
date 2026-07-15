@@ -95,8 +95,6 @@ export default function Home() {
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [codeSent, setCodeSent] = useState(false);
-  const [deliveryId, setDeliveryId] = useState("");
-  const [deliveryStatus, setDeliveryStatus] = useState("");
   const [googleAvailable, setGoogleAvailable] = useState(false);
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<View>("home");
@@ -146,13 +144,6 @@ export default function Home() {
       if(data.user){setEmail(data.user.email);setReputation(data.user.reputation??80);setIsAdmin(Boolean(data.user.isAdmin));setLoggedIn(true)}
     }).finally(()=>setAuthChecking(false));
   },[]);
-
-  useEffect(()=>{
-    if(!codeSent||!deliveryId)return;
-    let stopped=false;let attempts=0;
-    const check=async()=>{attempts+=1;try{const response=await fetch(`/api/auth/email-status?id=${encodeURIComponent(deliveryId)}`);const data=await response.json() as {status?:string};if(response.ok&&!stopped){setDeliveryStatus(data.status||"queued");if(["delivered","bounced","complained","failed"].includes(data.status||""))return}}catch{}if(!stopped&&attempts<12)window.setTimeout(check,5000)};
-    void check();return()=>{stopped=true};
-  },[codeSent,deliveryId]);
 
   useEffect(()=>{
     const updateCountdown=()=>setNextDailyCountdown(getNextDailyCountdown(new Date()));
@@ -208,9 +199,9 @@ export default function Home() {
     e.preventDefault();setBusy(true);
     try{
       const response=await fetch(codeSent?"/api/auth/verify-code":"/api/auth/request-code",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(codeSent?{email,code}:{email})});
-      const data=await response.json() as {error?:string;message?:string;deliveryId?:string};
+      const data=await response.json() as {error?:string;message?:string};
       if(!response.ok) throw new Error(data.error||"请求失败，请稍后再试");
-      if(!codeSent){setDeliveryId(data.deliveryId||"");setDeliveryStatus("queued");setCodeSent(true);flash(data.message||"验证码已发送，请检查邮箱");return}
+      if(!codeSent){setCodeSent(true);flash(data.message||"验证码已发送，请检查邮箱");return}
       setLoggedIn(true);flash("邮箱已验证，已进入安全账户");
     }catch(error){flash(error instanceof Error?error.message:"请求失败，请稍后再试")}finally{setBusy(false)}
   }
@@ -309,7 +300,7 @@ export default function Home() {
   if(!loggedIn) return <main className="login-page">
     <div className="login-brand"><span className="brand-mark">R</span><b>Relay 接棒</b></div>
     <section className="login-copy"><span className="overline">PRIVATE TALENT NETWORK</span><h1>不用海投。<br/><em>让真正做过的人帮你接棒。</em></h1><p>岗位和求职画像不会公开浏览。AI 每日理解能力、项目成果和跨行业可迁移性，只推送少量值得认真了解的匿名机会。</p><div className="login-proof"><span>Google 或邮箱登录</span><span>全程匿名沟通</span><span>反馈持续优化</span></div></section>
-    <section className="login-box"><span className="step-tag">安全入口</span><h2>登录 Relay</h2><p>使用 Google 可直接进入；也可以继续使用邮箱验证码。两种方式使用相同邮箱时会自动关联为同一个账号。</p><button type="button" className="google-login" disabled={!googleAvailable||busy} onClick={()=>{window.location.href="/api/auth/google/start"}}><span className="google-mark">G</span><b>{googleAvailable?"使用 Google 账号登录":"Google 登录等待管理员配置"}</b><span>→</span></button><div className="login-divider"><span>或使用邮箱验证码</span></div><form onSubmit={login}><label>邮箱地址</label><div className="phone-input"><span>@</span><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com" required disabled={codeSent||busy}/></div>{codeSent&&<><label>邮箱验证码</label><input className="code-input" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,"").slice(0,6))} inputMode="numeric" autoComplete="one-time-code" placeholder="输入邮件中的 6 位验证码" required/></>}<button disabled={busy}>{busy?"正在处理…":codeSent?"验证邮箱并进入":"发送邮箱验证码"}<span>→</span></button></form>{codeSent&&<div className={`delivery-status ${deliveryStatus}`}><b>{deliveryStatus==="delivered"?"邮件服务商已确认投递":deliveryStatus==="bounced"||deliveryStatus==="failed"?"邮件被收件服务器退回":deliveryStatus==="complained"?"邮件被标记为垃圾邮件":deliveryStatus==="opened"?"邮件已被打开":"正在确认投递结果…"}</b><span>{deliveryStatus==="delivered"?"如果收件箱没有，请搜索“Relay”并检查垃圾邮件或促销分类。":deliveryStatus==="bounced"||deliveryStatus==="failed"?"请检查邮箱拼写，或换一个邮箱重新发送。":"通常会在几十秒内更新。"}</span></div>}{codeSent&&<button className="text-button" onClick={()=>{setCodeSent(false);setCode("");setDeliveryId("");setDeliveryStatus("")}}>更换邮箱或重新发送</button>}<small>邮箱验证码会真实发送，10 分钟内有效。</small></section>
+    <section className="login-box"><span className="step-tag">安全入口</span><h2>登录 Relay</h2><p>使用 Google 可直接进入；也可以继续使用邮箱验证码。两种方式使用相同邮箱时会自动关联为同一个账号。</p><button type="button" className="google-login" disabled={!googleAvailable||busy} onClick={()=>{window.location.href="/api/auth/google/start"}}><span className="google-mark">G</span><b>{googleAvailable?"使用 Google 账号登录":"Google 登录等待管理员配置"}</b><span>→</span></button><div className="login-divider"><span>或使用邮箱验证码</span></div><form onSubmit={login}><label>邮箱地址</label><div className="phone-input"><span>@</span><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com" required disabled={codeSent||busy}/></div>{codeSent&&<><label>邮箱验证码</label><input className="code-input" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,"").slice(0,6))} inputMode="numeric" autoComplete="one-time-code" placeholder="输入邮件中的 6 位验证码" required/></>}<button disabled={busy}>{busy?"正在处理…":codeSent?"验证邮箱并进入":"发送邮箱验证码"}<span>→</span></button></form>{codeSent&&<button className="text-button" onClick={()=>{setCodeSent(false);setCode("")}}>更换邮箱或重新发送</button>}<small>邮箱验证码会真实发送，10 分钟内有效。</small></section>
     {toast&&<div className="toast">{toast}</div>}
   </main>;
 

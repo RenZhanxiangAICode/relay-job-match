@@ -70,6 +70,8 @@ test("supports Google OAuth while keeping email verification", async () => {
   ]);
   assert.match(page, /使用 Google 账号登录/);
   assert.match(page, /或使用邮箱验证码/);
+  assert.doesNotMatch(page, /正在确认投递结果/);
+  assert.doesNotMatch(page, /通常会在几十秒内更新/);
   assert.match(page, /\/api\/auth\/google\/start/);
   assert.match(worker, /accounts\.google\.com\/o\/oauth2\/v2\/auth/);
   assert.match(worker, /oauth2\.googleapis\.com\/token/);

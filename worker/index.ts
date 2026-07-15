@@ -339,7 +339,7 @@ async function requestCode(request: Request, env: Env) {
     await env.DB.prepare("DELETE FROM email_verification_codes WHERE email = ?").bind(email).run();
     return json({ error: sent.message }, 503);
   }
-  return json({ ok: true, message: "验证码已提交发送；正在确认邮箱服务商的投递结果", deliveryId: sent.deliveryId });
+  return json({ ok: true, message: "验证码已发送，请检查邮箱", deliveryId: sent.deliveryId });
 }
 
 async function emailDeliveryStatusApi(request: Request, env: Env) {
