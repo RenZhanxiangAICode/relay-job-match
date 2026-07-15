@@ -283,7 +283,7 @@ async function requireUser(request: Request, env: Env) {
 
 async function sendVerificationEmail(env: Env, email: string, code: string) {
   if (!env.RESEND_API_KEY || !env.EMAIL_FROM) {
-    return { ok: false, message: "邮件服务尚未配置" };
+    return { ok: false, message: "邮件服务尚未配置", deliveryId: "" };
   }
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -301,10 +301,13 @@ async function sendVerificationEmail(env: Env, email: string, code: string) {
       tags: [{ name: "category", value: "login_code" }],
     }),
   });
-  if (response.ok) return { ok: true, message: "" };
+  if (response.ok) {
+    const result = await response.json() as { id?: string };
+    return { ok: true, message: "", deliveryId: result.id ?? "" };
+  }
   const detail = await response.text();
   console.error("Resend error", response.status, detail.slice(0, 500));
-  return { ok: false, message: "验证码邮件发送失败，请稍后重试" };
+  return { ok: false, message: "验证码邮件发送失败，请稍后重试", deliveryId: "" };
 }
 
 async function requestCode(request: Request, env: Env) {
@@ -332,7 +335,17 @@ async function requestCode(request: Request, env: Env) {
     await env.DB.prepare("DELETE FROM email_verification_codes WHERE email = ?").bind(email).run();
     return json({ error: sent.message }, 503);
   }
-  return json({ ok: true, message: "验证码已提交发送；若 1 分钟内未收到，请检查垃圾邮件，有效期 10 分钟" });
+  return json({ ok: true, message: "验证码已提交发送；正在确认邮箱服务商的投递结果", deliveryId: sent.deliveryId });
+}
+
+async function emailDeliveryStatusApi(request: Request, env: Env) {
+  if (!env.RESEND_API_KEY) return json({ error: "邮件服务尚未配置" }, 503);
+  const id = new URL(request.url).searchParams.get("id")?.trim() ?? "";
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return json({ error: "投递编号无效" }, 400);
+  const response = await fetch(`https://api.resend.com/emails/${encodeURIComponent(id)}`, { headers: { authorization: `Bearer ${env.RESEND_API_KEY}` } });
+  const result = await response.json() as { last_event?: string; created_at?: string; message?: string };
+  if (!response.ok) return json({ error: result.message || "暂时无法读取投递状态" }, 502);
+  return json({ status: result.last_event || "queued", createdAt: result.created_at || null });
 }
 
 async function verifyCode(request: Request, env: Env) {
@@ -1068,6 +1081,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   const { pathname } = new URL(request.url);
   if (pathname === "/api/auth/request-code" && request.method === "POST") return requestCode(request, env);
   if (pathname === "/api/auth/verify-code" && request.method === "POST") return verifyCode(request, env);
+  if (pathname === "/api/auth/email-status" && request.method === "GET") return emailDeliveryStatusApi(request, env);
   if (pathname === "/api/auth/logout" && request.method === "POST") return logout(request, env);
   if (pathname === "/api/auth/me" && request.method === "GET") {
     const user = await currentUser(request, env);
