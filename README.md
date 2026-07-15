@@ -4,7 +4,7 @@
 
 ## 功能
 
-- Resend 真实邮箱验证码登录
+- Google OAuth 登录，同时保留 Resend 真实邮箱验证码登录；相同邮箱自动关联同一账号
 - Gemini 结构化输出解析岗位 JD 与求职资料
 - 待接棒岗位与求职画像，每类每账号最多一条
 - 两个方向分别每周最多 10 条匿名匹配
@@ -35,6 +35,7 @@ npm run dev
 项目使用 Drizzle ORM + Cloudflare D1（SQLite）。数据模型包含：
 
 - `users`：邮箱账号、信誉分与封禁状态
+- `oauth_identities`：Google 身份与 Relay 用户的安全关联，不存储 Google 密码
 - `profiles`：接棒/求职画像，数据库约束每人每类仅一条
 - `profile_keywords`：关键词倒排索引，用于数据库候选召回
 - `match_runs`：每个画像每周的增量匹配执行记录
@@ -57,6 +58,15 @@ npm run db:generate
 ## 部署
 
 当前结构使用 vinext，适合部署到 Cloudflare Workers / OpenAI Sites 的免费层。`.openai/hosting.json` 已声明 `DB` D1 绑定，真实数据库由部署平台创建和注入。
+
+### Google 登录配置
+
+在 Google Cloud 创建“Web 应用”OAuth 客户端，并设置：
+
+- 已获授权的 JavaScript 来源：`https://relayjob.dpdns.org`
+- 已获授权的重定向 URI：`https://relayjob.dpdns.org/api/auth/google/callback`
+
+将客户端凭据保存为部署环境变量 `GOOGLE_CLIENT_ID` 和 `GOOGLE_CLIENT_SECRET`，再设置 `APP_ORIGIN=https://relayjob.dpdns.org`。客户端密钥不得提交到 GitHub。Google 返回经过验证的邮箱后，Relay 会创建账号；如果该邮箱已使用验证码登录，会自动关联现有账号。
 
 ## 开发命令
 

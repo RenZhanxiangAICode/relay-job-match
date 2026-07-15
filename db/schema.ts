@@ -25,6 +25,18 @@ export const sessions = sqliteTable("sessions", {
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [index("sessions_user_idx").on(table.userId)]);
 
+export const oauthIdentities = sqliteTable("oauth_identities", {
+  provider: text("provider", { enum: ["google"] }).notNull(),
+  providerSubject: text("provider_subject").notNull(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  email: text("email").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.provider, table.providerSubject] }),
+  index("oauth_identities_user_idx").on(table.userId),
+]);
+
 export const profiles = sqliteTable("profiles", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),

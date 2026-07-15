@@ -10,6 +10,9 @@ interface Env {
   ADMIN_EMAILS?: string;
   GEMINI_API_KEY?: string;
   GEMINI_MODEL?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  APP_ORIGIN?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -29,6 +32,7 @@ type SessionUser = { id: string; email: string; reputation: number; status: stri
 const SESSION_COOKIE = "relay_session";
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
 const CODE_SECONDS = 10 * 60;
+const GOOGLE_STATE_COOKIE = "relay_google_state";
 const PROFILE_FIELDS = {
   role: ["city", "role", "industry", "work", "experience", "education", "projects", "ability", "knowledge", "culture", "system", "travel", "growth", "referral", "process", "warning", "leave"],
   talent: ["experience", "education", "ability", "projects", "industry", "company", "reject", "city", "salary", "arrival", "plan", "personality", "credential"],
@@ -385,6 +389,85 @@ async function verifyCode(request: Request, env: Env) {
     .bind(tokenHash, userId, now + SESSION_SECONDS, now).run();
   const cookie = `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_SECONDS}`;
   return json({ ok: true, user: { email, reputation: 80 } }, 200, { "set-cookie": cookie });
+}
+
+function redirect(location: string, cookies: string[] = []) {
+  const headers = new Headers({ location, "cache-control": "no-store" });
+  for (const cookie of cookies) headers.append("set-cookie", cookie);
+  return new Response(null, { status: 302, headers });
+}
+
+function configuredAppOrigin(request: Request, env: Env) {
+  try { return env.APP_ORIGIN ? new URL(env.APP_ORIGIN).origin : new URL(request.url).origin; }
+  catch { return new URL(request.url).origin; }
+}
+
+async function googleStartApi(request: Request, env: Env) {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return json({ error: "Google 登录尚未完成配置" }, 503);
+  const appOrigin = configuredAppOrigin(request, env);
+  if (new URL(request.url).origin !== appOrigin) return redirect(`${appOrigin}/api/auth/google/start`);
+  const state = randomToken();
+  const nonce = randomToken();
+  const redirectUri = `${appOrigin}/api/auth/google/callback`;
+  const authorization = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  authorization.search = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "openid email profile",
+    state,
+    nonce,
+    prompt: "select_account",
+  }).toString();
+  const stateCookie = `${GOOGLE_STATE_COOKIE}=${encodeURIComponent(`${state}.${nonce}`)}; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/google; Max-Age=600`;
+  return redirect(authorization.toString(), [stateCookie]);
+}
+
+async function googleCallbackApi(request: Request, env: Env) {
+  const appOrigin = configuredAppOrigin(request, env);
+  const clearState = `${GOOGLE_STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/google; Max-Age=0`;
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return redirect(`${appOrigin}/?auth_error=google_not_configured`, [clearState]);
+  const url = new URL(request.url);
+  const stateParts = cookieValue(request, GOOGLE_STATE_COOKIE).split(".");
+  const returnedState = url.searchParams.get("state") ?? "";
+  const code = url.searchParams.get("code") ?? "";
+  if (url.searchParams.get("error")) return redirect(`${appOrigin}/?auth_error=google_cancelled`, [clearState]);
+  if (!code || stateParts.length !== 2 || !returnedState || returnedState !== stateParts[0]) return redirect(`${appOrigin}/?auth_error=google_state`, [clearState]);
+
+  const redirectUri = `${appOrigin}/api/auth/google/callback`;
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, code, grant_type: "authorization_code", redirect_uri: redirectUri }),
+  });
+  const tokens = await tokenResponse.json() as { access_token?: string; error?: string };
+  if (!tokenResponse.ok || !tokens.access_token) return redirect(`${appOrigin}/?auth_error=google_token`, [clearState]);
+  const userResponse = await fetch("https://openidconnect.googleapis.com/v1/userinfo", { headers: { authorization: `Bearer ${tokens.access_token}` } });
+  const googleUser = await userResponse.json() as { sub?: string; email?: string; email_verified?: boolean };
+  const email = normalizeEmail(googleUser.email);
+  if (!userResponse.ok || !googleUser.sub || !googleUser.email_verified || !validEmail(email)) return redirect(`${appOrigin}/?auth_error=google_identity`, [clearState]);
+
+  const now = Math.floor(Date.now() / 1000);
+  const identity = await env.DB.prepare("SELECT user_id AS userId FROM oauth_identities WHERE provider = 'google' AND provider_subject = ?")
+    .bind(googleUser.sub).first<{ userId: string }>();
+  const emailUser = await env.DB.prepare("SELECT id, status FROM users WHERE email = ?").bind(email).first<{ id: string; status: string }>();
+  const userId = identity?.userId ?? emailUser?.id ?? crypto.randomUUID();
+  const status = identity ? await env.DB.prepare("SELECT status FROM users WHERE id = ?").bind(userId).first<{ status: string }>() : emailUser;
+  if (status?.status !== undefined && status.status !== "active") return redirect(`${appOrigin}/?auth_error=account_unavailable`, [clearState]);
+  const userStatement = identity
+    ? env.DB.prepare("UPDATE users SET email_verified_at = ?, updated_at = ? WHERE id = ?").bind(now, now, userId)
+    : env.DB.prepare(`INSERT INTO users (id, email, email_verified_at, reputation, status, created_at, updated_at) VALUES (?, ?, ?, 80, 'active', ?, ?)
+        ON CONFLICT(email) DO UPDATE SET email_verified_at = excluded.email_verified_at, updated_at = excluded.updated_at`).bind(userId, email, now, now, now);
+  await env.DB.batch([
+    userStatement,
+    env.DB.prepare(`INSERT INTO oauth_identities (provider, provider_subject, user_id, email, created_at, updated_at) VALUES ('google', ?, ?, ?, ?, ?)
+      ON CONFLICT(provider, provider_subject) DO UPDATE SET email = excluded.email, updated_at = excluded.updated_at`).bind(googleUser.sub, userId, email, now, now),
+  ]);
+  const token = randomToken();
+  await env.DB.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256(token), userId, now + SESSION_SECONDS, now).run();
+  const sessionCookie = `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_SECONDS}`;
+  return redirect(`${appOrigin}/`, [clearState, sessionCookie]);
 }
 
 async function logout(request: Request, env: Env) {
@@ -983,7 +1066,7 @@ async function adminDatabaseApi(request: Request, env: Env) {
   if (auth.response || !auth.user) return auth.response!;
   if (!isAdmin(env, auth.user.email)) return json({ error: "无管理员权限" }, 403);
   const tableNames = [
-    "users", "profiles", "profile_keywords", "matches", "match_runs", "match_exclusions",
+    "users", "oauth_identities", "profiles", "profile_keywords", "matches", "match_runs", "match_exclusions",
     "conversations", "messages", "reputation_events", "reports", "jury_assignments", "jury_votes",
     "appeals", "publication_cycles", "ai_parse_usage",
     "match_feedback", "admin_match_refreshes", "notifications", "reviews",
@@ -1079,6 +1162,9 @@ async function adminMatchRefreshApi(request: Request, env: Env, ctx: ExecutionCo
 
 async function api(request: Request, env: Env, ctx: ExecutionContext) {
   const { pathname } = new URL(request.url);
+  if (pathname === "/api/auth/providers" && request.method === "GET") return json({ google: Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) });
+  if (pathname === "/api/auth/google/start" && request.method === "GET") return googleStartApi(request, env);
+  if (pathname === "/api/auth/google/callback" && request.method === "GET") return googleCallbackApi(request, env);
   if (pathname === "/api/auth/request-code" && request.method === "POST") return requestCode(request, env);
   if (pathname === "/api/auth/verify-code" && request.method === "POST") return verifyCode(request, env);
   if (pathname === "/api/auth/email-status" && request.method === "GET") return emailDeliveryStatusApi(request, env);

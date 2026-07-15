@@ -58,6 +58,25 @@ test("keeps real email auth and persistent profiles wired", async () => {
   assert.equal(JSON.parse(hosting).d1, "DB");
   assert.match(envExample, /RESEND_API_KEY=/);
   assert.match(envExample, /AUTH_SECRET=/);
+  assert.match(envExample, /GOOGLE_CLIENT_ID=/);
+  assert.match(envExample, /GOOGLE_CLIENT_SECRET=/);
+});
+
+test("supports Google OAuth while keeping email verification", async () => {
+  const [page, worker, schema] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /使用 Google 账号登录/);
+  assert.match(page, /或使用邮箱验证码/);
+  assert.match(page, /\/api\/auth\/google\/start/);
+  assert.match(worker, /accounts\.google\.com\/o\/oauth2\/v2\/auth/);
+  assert.match(worker, /oauth2\.googleapis\.com\/token/);
+  assert.match(worker, /openidconnect\.googleapis\.com\/v1\/userinfo/);
+  assert.match(worker, /\/api\/auth\/google\/callback/);
+  assert.match(worker, /relay_google_state/);
+  assert.match(schema, /oauthIdentities/);
 });
 
 test("uses indexed incremental matching and per-direction monthly limits", async () => {
