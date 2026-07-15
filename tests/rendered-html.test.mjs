@@ -69,12 +69,18 @@ test("uses indexed incremental matching and per-direction monthly limits", async
 
   assert.match(worker, /JOIN profile_keywords other ON other\.keyword = mine\.keyword/);
   assert.match(worker, /LIMIT 100/);
-  assert.match(worker, /if \(keywordScore < 90\) continue/);
   assert.match(worker, /cosine\(ownVector, candidateVector\)/);
+  assert.match(worker, /rankCandidatesWithAi/);
+  assert.match(worker, /gemini-rerank-v2/);
+  assert.match(worker, /recentMatchingFeedback/);
+  assert.match(worker, /match_feedback/);
+  assert.match(worker, /\/api\/admin\/matches\/refresh/);
   assert.match(worker, /match_runs/);
   assert.match(worker, /publication_cycles/);
   assert.match(schema, /profileKeywords/);
   assert.match(schema, /publicationCycles/);
+  assert.match(schema, /matchFeedback/);
+  assert.match(schema, /adminMatchRefreshes/);
   assert.match(page, /暂停入池/);
   assert.match(page, /本月已删除过/);
   assert.match(page, /历史匹配/);
@@ -82,10 +88,14 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /\/api\/ai\/parse-profile/);
   assert.match(page, /岗位项目经验与产出/);
   assert.match(page, /我的项目经验与成果/);
+  assert.match(page, /我的教育经历/);
+  assert.match(page, /所需经验/);
   assert.match(page, /15 天未回复/);
   assert.match(page, /后台数据库/);
-  assert.match(page, /getNextMondayCountdown/);
-  assert.match(page, /距离下周一 00:00/);
+  assert.match(page, /getNextDailyCountdown/);
+  assert.match(page, /距离下一次每日更新/);
+  assert.match(page, /暂时隐藏/);
+  assert.match(page, /收藏/);
   assert.doesNotMatch(page, /关键词达标后再通过向量复核/);
   assert.match(worker, /\/api\/admin\/database/);
   assert.match(worker, /generativelanguage\.googleapis\.com/);

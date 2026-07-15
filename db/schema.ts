@@ -97,12 +97,38 @@ export const matches = sqliteTable("matches", {
   weekKey: text("week_key").notNull(),
   roleDecision: text("role_decision", { enum: ["pending", "interested", "hidden"] }).notNull().default("pending"),
   talentDecision: text("talent_decision", { enum: ["pending", "interested", "hidden"] }).notNull().default("pending"),
+  roleFavorite: integer("role_favorite", { mode: "boolean" }).notNull().default(false),
+  talentFavorite: integer("talent_favorite", { mode: "boolean" }).notNull().default(false),
+  algorithmVersion: text("algorithm_version").notNull().default("keyword-v1"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [
   uniqueIndex("matches_pair_week_unique").on(table.roleProfileId, table.talentProfileId, table.weekKey),
   index("matches_role_week_idx").on(table.roleProfileId, table.weekKey),
   index("matches_talent_week_idx").on(table.talentProfileId, table.weekKey),
 ]);
+
+export const matchFeedback = sqliteTable("match_feedback", {
+  id: text("id").primaryKey(),
+  matchId: text("match_id").notNull().references(() => matches.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  action: text("action", { enum: ["interested", "hidden", "unhidden", "favorite", "unfavorite"] }).notNull(),
+  reason: text("reason"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [
+  index("match_feedback_user_time_idx").on(table.userId, table.createdAt),
+  index("match_feedback_match_idx").on(table.matchId),
+]);
+
+export const adminMatchRefreshes = sqliteTable("admin_match_refreshes", {
+  id: text("id").primaryKey(),
+  requestedBy: text("requested_by").notNull().references(() => users.id),
+  status: text("status", { enum: ["running", "completed", "failed"] }).notNull().default("running"),
+  processedProfiles: integer("processed_profiles").notNull().default(0),
+  matchedCount: integer("matched_count").notNull().default(0),
+  error: text("error"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  completedAt: integer("completed_at", { mode: "timestamp" }),
+}, (table) => [index("admin_match_refresh_status_idx").on(table.status, table.createdAt)]);
 
 export const conversations = sqliteTable("conversations", {
   id: text("id").primaryKey(),
