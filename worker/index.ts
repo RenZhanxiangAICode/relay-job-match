@@ -332,7 +332,7 @@ async function requestCode(request: Request, env: Env) {
     await env.DB.prepare("DELETE FROM email_verification_codes WHERE email = ?").bind(email).run();
     return json({ error: sent.message }, 503);
   }
-  return json({ ok: true, message: "验证码已发送，有效期 10 分钟" });
+  return json({ ok: true, message: "验证码已提交发送；若 1 分钟内未收到，请检查垃圾邮件，有效期 10 分钟" });
 }
 
 async function verifyCode(request: Request, env: Env) {
@@ -1002,6 +1002,20 @@ async function adminDatabaseApi(request: Request, env: Env) {
   return json({ counts, users: users.results, profiles: profiles.results, matches: matches.results });
 }
 
+async function adminEmailLogApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!isAdmin(env, auth.user.email)) return json({ error: "无管理员权限" }, 403);
+  if (!env.RESEND_API_KEY) return json({ error: "邮件服务尚未配置" }, 503);
+  const requestedEmail = normalizeEmail(new URL(request.url).searchParams.get("email"));
+  if (!validEmail(requestedEmail)) return json({ error: "邮箱格式不正确" }, 400);
+  const response = await fetch("https://api.resend.com/emails?limit=100", { headers: { authorization: `Bearer ${env.RESEND_API_KEY}` } });
+  const result = await response.json() as { data?: Array<{ id: string; to: string[]; from: string; subject: string; created_at: string; last_event: string }>; message?: string };
+  if (!response.ok) return json({ error: result.message || "无法读取投递记录" }, 502);
+  const deliveries = (result.data || []).filter((item) => item.to.some((address) => address.toLowerCase() === requestedEmail)).slice(0, 10);
+  return json({ email: requestedEmail, deliveries });
+}
+
 async function runAdminMatchRefresh(env: Env, jobId: string) {
   try {
     const profiles = await env.DB.prepare("SELECT id FROM profiles WHERE status = 'pooled' ORDER BY updated_at DESC")
@@ -1079,6 +1093,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (notificationMatch && request.method === "PUT") return notificationsApi(request, env, notificationMatch[1]);
   if (pathname === "/api/admin/summary" && request.method === "GET") return adminSummaryApi(request, env);
   if (pathname === "/api/admin/database" && request.method === "GET") return adminDatabaseApi(request, env);
+  if (pathname === "/api/admin/email-log" && request.method === "GET") return adminEmailLogApi(request, env);
   if (pathname === "/api/admin/matches/refresh") return adminMatchRefreshApi(request, env, ctx);
   return json({ error: "接口不存在" }, 404);
 }
