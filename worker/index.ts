@@ -818,7 +818,8 @@ async function dashboardApi(request: Request, env: Env) {
   const conversationsPromise = env.DB.prepare(`
     SELECT c.id, c.match_id AS matchId, c.status,
       CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
-      m.score,
+      m.score, rp.user_id AS roleUserId, rp.payload AS rolePayload, tp.payload AS talentPayload,
+      m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
       (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
       (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount
     FROM conversations c
@@ -869,6 +870,15 @@ async function dashboardApi(request: Request, env: Env) {
     ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
     ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
   ].sort((a, b) => Number(b.score) - Number(a.score));
+  const conversationItems = conversations.results.map((row) => {
+    const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
+    return {
+      id: row.id, matchId: row.matchId, status: row.status, anonymousCode: row.anonymousCode, score: row.score,
+      lastMessage: row.lastMessage, messageCount: row.messageCount, perspective,
+      payload: JSON.parse(String(perspective === "role" ? row.talentPayload : row.rolePayload)),
+      reasons: JSON.parse(String(row.reasons)), risks: JSON.parse(String(row.risks)), verifyOnMeeting: JSON.parse(String(row.verifyOnMeeting)),
+    };
+  });
   const history = historyRows.results.map((row) => {
     const isRole = row.roleUserId === auth.user.id;
     const ownDecision = String(isRole ? row.roleDecision : row.talentDecision);
@@ -891,7 +901,7 @@ async function dashboardApi(request: Request, env: Env) {
 
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, publicationLimits, readyForMatching, matches, history, notifications: notificationRows.results, conversations: conversations.results,
+    profiles: profileRows, publicationLimits, readyForMatching, matches, history, notifications: notificationRows.results, conversations: conversationItems,
     matchingStats: {
       role: matches.filter((match) => match.perspective === "role").length,
       talent: matches.filter((match) => match.perspective === "talent").length,
@@ -995,11 +1005,13 @@ async function conversationContext(env: Env, conversationId: string, userId: str
     SELECT c.id, c.status, c.success_requested_by AS successRequestedBy, m.id AS matchId, m.score,
       rp.user_id AS roleUserId, tp.user_id AS talentUserId,
       CASE WHEN rp.user_id = ? THEN tp.user_id ELSE rp.user_id END AS otherUserId,
-      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode
+      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
+      CASE WHEN rp.user_id = ? THEN tp.payload ELSE rp.payload END AS opposingPayload,
+      m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting
     FROM conversations c JOIN matches m ON m.id = c.match_id
     JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
     WHERE c.id = ? AND (rp.user_id = ? OR tp.user_id = ?)
-  `).bind(userId, userId, conversationId, userId, userId).first<Record<string, string | number | null>>();
+  `).bind(userId, userId, userId, conversationId, userId, userId).first<Record<string, string | number | null>>();
 }
 
 async function conversationMessagesApi(request: Request, env: Env, conversationId: string) {
@@ -1010,7 +1022,7 @@ async function conversationMessagesApi(request: Request, env: Env, conversationI
   if (request.method === "GET") {
     const rows = await env.DB.prepare(`SELECT id, sender_id AS senderId, body, created_at AS createdAt FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500`)
       .bind(conversationId).all<Record<string, string | number>>();
-    return json({ conversation: { id: conversationId, status: context.status, anonymousCode: context.anonymousCode, score: context.score, successRequestedByMe: context.successRequestedBy === auth.user.id }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
+    return json({ conversation: { id: conversationId, matchId: context.matchId, status: context.status, anonymousCode: context.anonymousCode, score: context.score, perspective: context.roleUserId === auth.user.id ? "role" : "talent", payload: JSON.parse(String(context.opposingPayload)), reasons: JSON.parse(String(context.reasons)), risks: JSON.parse(String(context.risks)), verifyOnMeeting: JSON.parse(String(context.verifyOnMeeting)), successRequestedByMe: context.successRequestedBy === auth.user.id, messageCount: rows.results.length }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
   }
   if (request.method !== "POST") return json({ error: "不支持的请求" }, 405);
   if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
