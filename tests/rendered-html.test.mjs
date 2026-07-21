@@ -117,6 +117,13 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /距离下一次每日更新/);
   assert.match(page, /暂时隐藏/);
   assert.match(page, /收藏/);
+  assert.match(page, /已发出意向/);
+  assert.match(page, /已配对/);
+  assert.doesNotMatch(page, /await refreshDashboard\(\);\s*setHiddenReasonMatch/);
+  assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, cycles\] = await Promise\.all/);
+  assert.match(worker, /mutual: ownDecision === "interested"/);
+  assert.match(worker, /user: \{ email: auth\.user\.email, reputation: auth\.user\.reputation/);
+  assert.match(page, /onboardingChecked\.current/);
   assert.doesNotMatch(page, /关键词达标后再通过向量复核/);
   assert.match(worker, /\/api\/admin\/database/);
   assert.match(worker, /generativelanguage\.googleapis\.com/);

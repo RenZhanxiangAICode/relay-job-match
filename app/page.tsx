@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "role" | "talent";
 type View = "home" | "posts" | "matches" | "history" | "messages" | "notifications" | "trust" | "jury" | "admin";
@@ -120,7 +120,7 @@ export default function Home() {
   const [dataLoading, setDataLoading] = useState(false);
   const [toast, setToast] = useState("");
   const [onboardingOpen, setOnboardingOpen] = useState(false);
-  const [onboardingChecked, setOnboardingChecked] = useState(false);
+  const onboardingChecked = useRef(false);
   const [interviewOpen, setInterviewOpen] = useState(false);
   const [interviewStep, setInterviewStep] = useState(0);
   const [interviewAnswers, setInterviewAnswers] = useState<string[]>([]);
@@ -168,9 +168,9 @@ export default function Home() {
       setPublicationLimits(data.publicationLimits);
       setReadyForMatching(data.readyForMatching);setMatchItems(data.matches);setHistoryItems(data.history);setNotifications(data.notifications);setConversations(data.conversations);
       setMatchingStats(data.matchingStats);
-      if(!onboardingChecked){setOnboardingChecked(true);if(data.profiles.length===0)setOnboardingOpen(true)}
+      if(!onboardingChecked.current){onboardingChecked.current=true;if(data.profiles.length===0)setOnboardingOpen(true)}
     }catch{setToast("资料读取失败，请刷新后重试");setTimeout(()=>setToast(""),2600)}finally{setDataLoading(false)}
-  },[onboardingChecked]);
+  },[]);
 
   useEffect(()=>{
     if(!loggedIn) return;
@@ -234,15 +234,24 @@ export default function Home() {
     await refreshDashboard();flash("发布已删除；该方向本月还可新建一次");
   }
   async function decideMatch(matchId:string,decision:"pending"|"interested"|"hidden",reason=""){
-    const response=await fetch(`/api/matches/${matchId}/decision`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({decision,reason})});
-    const data=await response.json() as {error?:string};
-    if(!response.ok){flash(data.error||"操作失败");return}
-    await refreshDashboard();
-    setHiddenReasonMatch(null);flash(decision==="interested"?"已发出匿名意向":decision==="hidden"?"已隐藏；原因会用于优化后续匹配":"已恢复该匹配");
+    const previous=matchItems.find(item=>item.id===matchId);if(!previous)return;
+    setMatchItems(items=>items.map(item=>item.id===matchId?{...item,ownDecision:decision}:item));
+    setHiddenReasonMatch(null);
+    try{
+      const response=await fetch(`/api/matches/${matchId}/decision`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({decision,reason})});
+      const data=await response.json() as {error?:string;ownDecision?:MatchItem["ownDecision"];otherDecision?:MatchItem["otherDecision"];conversationId?:string|null;mutual?:boolean};
+      if(!response.ok)throw new Error(data.error||"操作失败");
+      setMatchItems(items=>items.map(item=>item.id===matchId?{...item,ownDecision:data.ownDecision||decision,otherDecision:data.otherDecision||item.otherDecision,conversationId:data.conversationId||item.conversationId}:item));
+      setMatchingStats(stats=>({...stats,mutual:Math.max(0,stats.mutual+(data.mutual&&!(previous.ownDecision==="interested"&&previous.otherDecision==="interested")?1:0))}));
+      flash(data.mutual?"双方已配对，可以开始匿名沟通":decision==="interested"?"已发出匿名意向":decision==="hidden"?"已隐藏；原因会用于优化后续匹配":"已恢复该匹配");
+    }catch(error){setMatchItems(items=>items.map(item=>item.id===matchId?previous:item));flash(error instanceof Error?error.message:"操作失败")}
   }
   async function toggleFavorite(matchId:string,favorite:boolean){
-    const response=await fetch(`/api/matches/${matchId}/favorite`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({favorite})});
-    const data=await response.json() as {error?:string};if(!response.ok){flash(data.error||"收藏失败");return}await refreshDashboard();flash(favorite?"已收藏，系统会学习你的偏好":"已取消收藏");
+    const previous=matchItems.find(item=>item.id===matchId);if(!previous)return;
+    setMatchItems(items=>items.map(item=>item.id===matchId?{...item,favorite}:item));
+    try{const response=await fetch(`/api/matches/${matchId}/favorite`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({favorite})});
+      const data=await response.json() as {error?:string};if(!response.ok)throw new Error(data.error||"收藏失败");flash(favorite?"已收藏，系统会学习你的偏好":"已取消收藏");
+    }catch(error){setMatchItems(items=>items.map(item=>item.id===matchId?previous:item));flash(error instanceof Error?error.message:"收藏失败")}
   }
   async function startAdminRefresh(){
     if(!window.confirm("确定立即启动一次全池 AI 增量匹配吗？系统会在后台处理所有有效画像。"))return;
@@ -336,7 +345,7 @@ export default function Home() {
 
       {view==="posts"&&<div className="page posts-page"><div className="page-heading"><div><span className="overline">MY PRIVATE POSTS</span><h1>我的发布</h1><p>两个方向分别管理：每月各可删除一次，删除后各可重新新建一次；暂停和恢复不限次数。</p></div><div className="post-limit"><b>{Object.values(profileMeta).filter(Boolean).length} / 2</b><span>当前有效发布</span></div></div><div className="post-cards">{(["role","talent"] as Mode[]).map(item=>{const profile=profileMeta[item];const limit=publicationLimits[item];return profile?<article key={item}><header><span>{profile.anonymousCode}</span><i>{profile.status==="paused"?"已暂停":"匹配中"}</i></header><h2>{item==="role"?"我的待接棒岗位":"我的找工作画像"}</h2><p>{item==="role"?[profile.payload.city,profile.payload.role,profile.payload.industry].filter(Boolean).join(" · "):[profile.payload.industry,profile.payload.city,profile.payload.salary].filter(Boolean).join(" · ")}</p><div className="post-meta"><span>画像完整度 <b>{profile.completion}%</b></span><span>今日匹配 <b>{matchItems.filter(match=>match.perspective===item).length}</b></span></div><div><button className="solid" onClick={()=>{setMode(item);setProfileOpen(true)}}>{item==="role"?"修改接棒信息":"修改求职信息"}</button><button className="outline" onClick={()=>changeProfileStatus(item,profile.status==="paused"?"pooled":"paused")}>{profile.status==="paused"?"恢复入池":"暂停入池"}</button><button className="danger" disabled={!limit.canDelete} onClick={()=>deleteProfile(item)}>{limit.canDelete?"删除发布":"本月已删除过"}</button></div></article>:<article className="empty-post" key={item}><span className="card-index">{item==="role"?"ROLE POST":"TALENT POST"}</span><h2>{item==="role"?"还没有待接棒岗位":"还没有求职画像"}</h2><p>{limit.canRecreate?(item==="role"?"提交真实岗位信息后，立即进行首次AI匹配。":"提交能力与求职偏好后，立即进行首次AI匹配。"):`该方向本月的新建次数已用完，下月可再次发布。`}</p><button className="solid" disabled={!limit.canRecreate} onClick={()=>{setMode(item);setProfileOpen(true)}}>{limit.canRecreate?"立即发布":"本月不可再新建"}</button></article>})}</div><div className="one-post-rule"><b>匹配什么时候更新？</b><p>首次发布立即匹配；之后每天更新一次。修改、收藏、想了解和隐藏原因都会进入下一轮AI排序。</p></div></div>}
 
-      {view==="matches"&&<div className="page"><div className="page-heading"><div><span className="overline">PRIVATE DAILY AI SELECTION</span><h1>今日匹配</h1><p>AI结合能力、项目成果、硬性条件、跨行业可迁移性和你的历史选择进行排序。</p></div><div className="week-count"><b>{String(matchItems.length).padStart(2,"0")}</b><span>/ 10 个今日机会</span></div></div>{dataLoading?<div className="empty-state"><h2>AI正在读取今日匹配…</h2></div>:!readyForMatching?<div className="empty-state"><span>✦</span><h2>匹配尚未开启</h2><p>请先发布“找工作”或“找接任者”任意一条信息。</p><button className="solid" onClick={()=>nav("posts")}>去完成我的发布</button></div>:matchItems.length===0?<div className="empty-state"><span>○</span><h2>今天还没有合适结果</h2><p>你的画像已进入私密池。系统不会为了凑满十条而展示明显不合适的机会。</p></div>:<div className="matches-list">{matchItems.map(m=><article className={`match-row ${m.ownDecision==="hidden"?"is-hidden":""}`} key={m.id}><div className="score-block"><b>{m.score}</b><span>匹配度</span><i>{m.score>=90?"高度匹配":m.score>=75?"值得了解":"探索机会"}</i></div><div className="match-body"><div className="match-title"><div><h2>{m.perspective==="talent"?`匿名岗位 ${m.anonymousCode}`:`匿名候选人 ${m.anonymousCode}`}</h2><p>{[m.payload.city,m.payload.role||m.payload.industry,m.payload.system||m.payload.salary].filter(Boolean).join(" · ")}</p></div><span className="verified">✓ 对方邮箱已验证</span></div><div className="match-reasons"><div><b>为什么值得聊</b><p>{m.reasons.join("；")}</p></div><div className="risk"><b>最大分歧与风险</b><p>{m.risks.join("；")}</p></div><div><b>沟通时应验证</b><p>{m.verifyOnMeeting.join("；")}</p></div></div><div className="match-actions"><button className={m.ownDecision==="interested"?"liked":""} disabled={m.ownDecision==="hidden"} onClick={()=>decideMatch(m.id,m.ownDecision==="interested"?"pending":"interested")}>{m.ownDecision==="interested"?"已发出意向 ✓":"想了解"}</button><button className={m.favorite?"favorite active":"favorite"} disabled={m.ownDecision==="hidden"} onClick={()=>toggleFavorite(m.id,!m.favorite)}>{m.favorite?"已收藏 ★":"收藏 ☆"}</button><button className={m.ownDecision==="hidden"?"hidden-btn":""} onClick={()=>m.ownDecision==="hidden"?decideMatch(m.id,"pending"):setHiddenReasonMatch(m.id)}>{m.ownDecision==="hidden"?"已隐藏·点击撤回":"暂时隐藏"}</button></div></div></article>)}</div>}</div>}
+      {view==="matches"&&<div className="page"><div className="page-heading"><div><span className="overline">PRIVATE DAILY AI SELECTION</span><h1>今日匹配</h1><p>AI结合能力、项目成果、硬性条件、跨行业可迁移性和你的历史选择进行排序。</p></div><div className="week-count"><b>{String(matchItems.length).padStart(2,"0")}</b><span>/ 10 个今日机会</span></div></div>{dataLoading?<div className="empty-state"><h2>AI正在读取今日匹配…</h2></div>:!readyForMatching?<div className="empty-state"><span>✦</span><h2>匹配尚未开启</h2><p>请先发布“找工作”或“找接任者”任意一条信息。</p><button className="solid" onClick={()=>nav("posts")}>去完成我的发布</button></div>:matchItems.length===0?<div className="empty-state"><span>○</span><h2>今天还没有合适结果</h2><p>你的画像已进入私密池。系统不会为了凑满十条而展示明显不合适的机会。</p></div>:<div className="matches-list">{matchItems.map(m=>{const paired=m.ownDecision==="interested"&&m.otherDecision==="interested";return <article className={`match-row ${m.ownDecision==="hidden"?"is-hidden":""}`} key={m.id}><div className="score-block"><b>{m.score}</b><span>匹配度</span><i>{m.score>=90?"高度匹配":m.score>=75?"值得了解":"探索机会"}</i></div><div className="match-body"><div className="match-title"><div><h2>{m.perspective==="talent"?`匿名岗位 ${m.anonymousCode}`:`匿名候选人 ${m.anonymousCode}`}</h2><p>{[m.payload.city,m.payload.role||m.payload.industry,m.payload.system||m.payload.salary].filter(Boolean).join(" · ")}</p></div><span className="verified">✓ 对方邮箱已验证</span></div><div className="match-reasons"><div><b>为什么值得聊</b><p>{m.reasons.join("；")}</p></div><div className="risk"><b>最大分歧与风险</b><p>{m.risks.join("；")}</p></div><div><b>沟通时应验证</b><p>{m.verifyOnMeeting.join("；")}</p></div></div><div className="match-actions"><button className={paired?"paired":m.ownDecision==="interested"?"liked":""} disabled={m.ownDecision==="hidden"} onClick={()=>paired&&m.conversationId?openConversation(m.conversationId):decideMatch(m.id,m.ownDecision==="interested"?"pending":"interested")}>{paired?"已配对 ✓":m.ownDecision==="interested"?"已发出意向 ✓":"想了解"}</button><button className={m.favorite?"favorite active":"favorite"} disabled={m.ownDecision==="hidden"} onClick={()=>toggleFavorite(m.id,!m.favorite)}>{m.favorite?"已收藏 ★":"收藏 ☆"}</button><button className={m.ownDecision==="hidden"?"hidden-btn":""} onClick={()=>m.ownDecision==="hidden"?decideMatch(m.id,"pending"):setHiddenReasonMatch(m.id)}>{m.ownDecision==="hidden"?"已隐藏·点击撤回":"暂时隐藏"}</button></div></div></article>})}</div>}</div>}
 
       {view==="history"&&<div className="page history-page"><div className="page-heading"><div><span className="overline">MATCH HISTORY</span><h1>历史匹配</h1><p>这里保留以前日期的真实匹配结果；已隐藏对象不会再次进入你的候选池。</p></div></div>{historyItems.length===0?<div className="empty-state"><span>◷</span><h2>还没有历史匹配</h2><p>新账号不会显示测试数据。每日更新后，以前的真实匹配会出现在这里。</p></div>:<div className="history-list">{historyItems.map(item=><article key={item.id}><div><span>{item.weekKey}</span><h2>{item.perspective==="talent"?"匿名岗位":"匿名候选人"} {item.anonymousCode}</h2><p>{item.outcome==="success"?"匹配成功":item.outcome==="failed"?"匹配失败或已隐藏":"本轮已结束"} · 匹配度 {item.score} 分</p></div><i className={item.outcome}>{item.outcome==="success"?"成功":item.outcome==="failed"?"失败":"已结束"}</i>{item.reviewAvailable&&<button className="outline" onClick={()=>flash("评价与追评将在评价功能上线后开放")}>评价 / 追评</button>}</article>)}</div>}</div>}
 

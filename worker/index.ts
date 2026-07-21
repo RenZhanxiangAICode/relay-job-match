@@ -588,6 +588,13 @@ async function runMatchForProfile(env: Env, profileId: string, force = false) {
 
 async function ensureDailyMatchesForUser(env: Env, userId: string) {
   const currentCycle = matchCycleKey();
+  const due = await env.DB.prepare(`
+    SELECT p.id FROM profiles p
+    LEFT JOIN match_runs r ON r.profile_id = p.id AND r.week_key = ?
+    WHERE p.user_id = ? AND p.status = 'pooled' AND r.profile_id IS NULL
+    LIMIT 1
+  `).bind(currentCycle, userId).first<{ id: string }>();
+  if (!due) return;
   await finalizeHiddenExclusions(env, userId, currentCycle);
   const profiles = await env.DB.prepare(`
     SELECT id, type, payload, search_text AS searchText FROM profiles WHERE user_id = ? AND status = 'pooled'
@@ -788,7 +795,7 @@ async function dashboardApi(request: Request, env: Env) {
   const profileRows = profiles.results.map((row) => ({ ...row, payload: JSON.parse(row.payload) }));
   const readyForMatching = profileRows.some((row) => row.status === "pooled");
 
-  const matchRows = readyForMatching ? await env.DB.prepare(`
+  const matchRowsPromise = readyForMatching ? env.DB.prepare(`
     SELECT m.id, m.score, m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
       m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
       m.role_favorite AS roleFavorite, m.talent_favorite AS talentFavorite, m.algorithm_version AS algorithmVersion,
@@ -801,7 +808,48 @@ async function dashboardApi(request: Request, env: Env) {
     LEFT JOIN conversations c ON c.match_id = m.id
     WHERE m.week_key = ? AND (rp.user_id = ? OR tp.user_id = ?)
     ORDER BY m.score DESC LIMIT 40
-  `).bind(matchCycleKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>() : { results: [] };
+  `).bind(matchCycleKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>() : Promise.resolve({ results: [] as Record<string, string | number | null>[] });
+
+  const notificationRowsPromise = env.DB.prepare(`
+    SELECT id, type, title, body, target_id AS targetId, read_at AS readAt, created_at AS createdAt
+    FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
+  `).bind(auth.user.id).all<Record<string, string | number | null>>();
+
+  const conversationsPromise = env.DB.prepare(`
+    SELECT c.id, c.match_id AS matchId, c.status,
+      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
+      m.score,
+      (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
+      (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount
+    FROM conversations c
+    JOIN matches m ON m.id = c.match_id
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE rp.user_id = ? OR tp.user_id = ?
+    ORDER BY c.created_at DESC
+  `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
+
+  const historyRowsPromise = env.DB.prepare(`
+    SELECT m.id, m.week_key AS weekKey, m.score, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
+      rp.user_id AS roleUserId, rp.anonymous_code AS roleCode,
+      tp.user_id AS talentUserId, tp.anonymous_code AS talentCode,
+      c.id AS conversationId
+    FROM matches m
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    LEFT JOIN conversations c ON c.match_id = m.id
+    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
+    ORDER BY m.week_key DESC, m.score DESC LIMIT 100
+  `).bind(matchCycleKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
+
+  const cyclesPromise = env.DB.prepare(`
+    SELECT type, delete_count AS deleteCount, recreate_count AS recreateCount
+    FROM publication_cycles WHERE user_id = ? AND month_key = ?
+  `).bind(auth.user.id, monthKey()).all<{ type: "role" | "talent"; deleteCount: number; recreateCount: number }>();
+
+  const [matchRows, notificationRows, conversations, historyRows, cycles] = await Promise.all([
+    matchRowsPromise, notificationRowsPromise, conversationsPromise, historyRowsPromise, cyclesPromise,
+  ]);
 
   const allMatches = matchRows.results.map((row) => {
     const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
@@ -821,37 +869,6 @@ async function dashboardApi(request: Request, env: Env) {
     ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
     ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
   ].sort((a, b) => Number(b.score) - Number(a.score));
-  const notificationRows = await env.DB.prepare(`
-    SELECT id, type, title, body, target_id AS targetId, read_at AS readAt, created_at AS createdAt
-    FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
-  `).bind(auth.user.id).all<Record<string, string | number | null>>();
-
-  const conversations = await env.DB.prepare(`
-    SELECT c.id, c.match_id AS matchId, c.status,
-      CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
-      m.score,
-      (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
-      (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount
-    FROM conversations c
-    JOIN matches m ON m.id = c.match_id
-    JOIN profiles rp ON rp.id = m.role_profile_id
-    JOIN profiles tp ON tp.id = m.talent_profile_id
-    WHERE rp.user_id = ? OR tp.user_id = ?
-    ORDER BY c.created_at DESC
-  `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
-
-  const historyRows = await env.DB.prepare(`
-    SELECT m.id, m.week_key AS weekKey, m.score, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
-      rp.user_id AS roleUserId, rp.anonymous_code AS roleCode,
-      tp.user_id AS talentUserId, tp.anonymous_code AS talentCode,
-      c.id AS conversationId
-    FROM matches m
-    JOIN profiles rp ON rp.id = m.role_profile_id
-    JOIN profiles tp ON tp.id = m.talent_profile_id
-    LEFT JOIN conversations c ON c.match_id = m.id
-    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
-    ORDER BY m.week_key DESC, m.score DESC LIMIT 100
-  `).bind(matchCycleKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
   const history = historyRows.results.map((row) => {
     const isRole = row.roleUserId === auth.user.id;
     const ownDecision = String(isRole ? row.roleDecision : row.talentDecision);
@@ -864,10 +881,6 @@ async function dashboardApi(request: Request, env: Env) {
     };
   });
 
-  const cycles = await env.DB.prepare(`
-    SELECT type, delete_count AS deleteCount, recreate_count AS recreateCount
-    FROM publication_cycles WHERE user_id = ? AND month_key = ?
-  `).bind(auth.user.id, monthKey()).all<{ type: "role" | "talent"; deleteCount: number; recreateCount: number }>();
   const publicationLimits = {
     role: { canDelete: true, canRecreate: true },
     talent: { canDelete: true, canRecreate: true },
@@ -926,7 +939,9 @@ async function matchDecisionApi(request: Request, env: Env, matchId: string) {
       createNotification(env, { userId: match.talentUserId, type: "mutual_match", title: "双方都想进一步了解", body: `你与匿名岗位 ${match.roleCode} 的匹配度为 ${match.score} 分，匿名沟通已经开启。`, targetId: conversationId, dedupeKey: `mutual:${matchId}:${match.talentUserId}` }),
     ]);
   }
-  return json({ ok: true, conversationId });
+  const ownDecision = match.roleUserId === auth.user.id ? updated?.roleDecision : updated?.talentDecision;
+  const otherDecision = match.roleUserId === auth.user.id ? updated?.talentDecision : updated?.roleDecision;
+  return json({ ok: true, conversationId, ownDecision, otherDecision, mutual: ownDecision === "interested" && otherDecision === "interested" });
 }
 
 async function matchFavoriteApi(request: Request, env: Env, matchId: string) {
