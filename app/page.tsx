@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent as ReactMouseEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "role" | "talent";
 type View = "home" | "posts" | "matches" | "history" | "messages" | "notifications" | "trust" | "jury" | "admin";
@@ -14,6 +14,10 @@ type ChatMessage = { id:string; body:string; mine:boolean; createdAt:number };
 type HistoryItem = { id:string; weekKey:string; score:number; outcome:"success"|"failed"|"ended"; anonymousCode:string; perspective:Mode; reviewAvailable:boolean };
 type AdminDatabase = {counts:Record<string,number>;users:Array<{email:string;reputation:number;status:string;createdAt:number}>;profiles:Array<{anonymousCode:string;type:Mode;status:string;completion:number;email:string;updatedAt:number}>;matches:Array<{score:number;weekKey:string;roleDecision:string;talentDecision:string;roleCode:string;talentCode:string;createdAt:number}>};
 type AdminRefresh = {id:string;status:"running"|"completed"|"failed";processedProfiles:number;matchedCount:number;error?:string|null;createdAt:number;completedAt?:number|null};
+type DashboardPayload = {user:{email:string;reputation:number;isAdmin:boolean};profiles:Array<{type:Mode;anonymousCode:string;status:string;completion:number;payload:Record<string,string>}>;publicationLimits:Record<Mode,PublicationLimit>;readyForMatching:boolean;matchingPending?:boolean;matches:MatchItem[];history:HistoryItem[];notifications:NotificationItem[];conversations:ConversationItem[];matchingStats:{role:number;talent:number;highScore:number;mutual:number}};
+
+const DASHBOARD_CACHE_KEY = "relay-dashboard-cache-v1";
+const VIEW_CACHE_KEY = "relay-current-view-v1";
 
 const roleFields: Field[] = [
   { key:"city", label:"公司城市", hint:"例：上海·浦东 / 可混合", required:true },
@@ -109,6 +113,8 @@ export default function Home() {
   const [reputation, setReputation] = useState(80);
   const [readyForMatching, setReadyForMatching] = useState(false);
   const [matchItems, setMatchItems] = useState<MatchItem[]>([]);
+  const [matchCategory, setMatchCategory] = useState<Mode>("talent");
+  const [matchingPending, setMatchingPending] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
@@ -128,19 +134,61 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatDraft, setChatDraft] = useState("");
   const [matchingStats, setMatchingStats] = useState({role:0,talent:0,highScore:0,mutual:0});
+  const cacheHydrated = useRef(false);
   const fields = mode === "role" ? roleFields : talentFields;
   const completion = useMemo(() => Math.round(fields.filter(f => values[`${mode}-${f.key}`]?.trim()).length / fields.length * 100), [fields, mode, values]);
   const unreadCount = notifications.filter(item=>!item.readAt).length;
   const activeConversationItem = conversations.find(item=>item.id===activeConversation);
   const draftProfile = (["role","talent"] as Mode[]).find(type=>profileMeta[type]?.status==="draft"||((profileMeta[type]?.completion??100)<100));
   const hasUnreadMessage = notifications.some(item=>!item.readAt&&item.type==="new_message");
+  const effectiveMatchCategory = matchItems.some(item=>item.perspective===matchCategory)?matchCategory:matchCategory==="talent"?"role":"talent";
+  const visibleMatchItems = matchItems.filter(item=>item.perspective===effectiveMatchCategory).slice(0,10);
+  const jobDirection = profileMeta.talent?.payload.industry||profileMeta.talent?.payload.company||profileMeta.talent?.payload.ability||"目标岗位";
+  const dailyCareerTip = useMemo(()=>{
+    const tips=[
+      `针对“${jobDirection}”，先准备一个能量化结果的项目案例：目标、你的动作和最终数字各用一句话说清。`,
+      `投递“${jobDirection}”前，把目标岗位最常见的三项要求与你的可迁移能力逐项对应，避免只写职责。`,
+      `和接棒人沟通“${jobDirection}”时，优先核实真实工作节奏、决策人和前三个月的成功标准。`,
+      `跨入“${jobDirection}”时，不要只强调兴趣；请拿出一个相邻项目，证明你已经解决过类似问题。`,
+      `今天可以为“${jobDirection}”准备三个反向问题：团队当前难题、岗位空缺原因、结果如何评价。`,
+    ];
+    const seed=`${new Date().toLocaleDateString("en-CA")}-${jobDirection}`.split("").reduce((sum,char)=>sum+char.charCodeAt(0),0);
+    return tips[seed%tips.length];
+  },[jobDirection]);
+
+  const applyDashboard=useCallback((data:DashboardPayload,allowOnboarding=true)=>{
+    const nextValues:Record<string,string> = {};
+    const nextMeta:Record<Mode,ProfileMeta|undefined> = {role:undefined,talent:undefined};
+    data.profiles.forEach(profile=>{
+      nextMeta[profile.type]={anonymousCode:profile.anonymousCode,status:profile.status,completion:profile.completion,payload:profile.payload};
+      Object.entries(profile.payload).forEach(([key,value])=>nextValues[`${profile.type}-${key}`]=String(value??""));
+    });
+    setEmail(data.user.email);setReputation(data.user.reputation);setIsAdmin(data.user.isAdmin);setValues(nextValues);setProfileMeta(nextMeta);
+    setPublicationLimits(data.publicationLimits);setReadyForMatching(data.readyForMatching);setMatchingPending(Boolean(data.matchingPending));
+    setMatchItems(data.matches.slice(0,10));setHistoryItems(data.history);setNotifications(data.notifications);setConversations(data.conversations);
+    setMatchingStats(data.matchingStats);
+    if(allowOnboarding&&!onboardingChecked.current){onboardingChecked.current=true;if(data.profiles.length===0)setOnboardingOpen(true)}
+  },[]);
+
+  useLayoutEffect(()=>{
+    try{
+      const cached=JSON.parse(window.sessionStorage.getItem(DASHBOARD_CACHE_KEY)||"null") as {savedAt?:number;data?:DashboardPayload}|null;
+      if(cached?.data&&cached.savedAt&&Date.now()-cached.savedAt<43_200_000){
+        // A layout effect intentionally restores the last verified screen before the browser paints.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        applyDashboard(cached.data,false);onboardingChecked.current=true;cacheHydrated.current=true;setLoggedIn(true);setAuthChecking(false);
+        const savedView=window.sessionStorage.getItem(VIEW_CACHE_KEY) as View|null;
+        if(savedView&&(["home","posts","matches","history","messages","notifications","trust","jury","admin"] as View[]).includes(savedView))setView(savedView);
+      }
+    }catch{window.sessionStorage.removeItem(DASHBOARD_CACHE_KEY)}
+  },[applyDashboard]);
 
   useEffect(()=>{
     fetch("/api/auth/providers").then(async response=>{if(response.ok){const data=await response.json() as {google?:boolean};setGoogleAvailable(Boolean(data.google))}}).catch(()=>undefined);
     const authError=new URLSearchParams(window.location.search).get("auth_error");
     if(authError){const messages:Record<string,string>={google_cancelled:"你已取消 Google 登录",google_state:"Google 登录状态已失效，请重新尝试",google_token:"Google 授权交换失败，请稍后重试",google_identity:"Google 账号邮箱未通过验证",google_not_configured:"Google 登录尚未完成配置",account_unavailable:"该账号当前不可用"};window.setTimeout(()=>flash(messages[authError]||"Google 登录失败"),0);window.history.replaceState({},"",window.location.pathname)}
     fetch("/api/auth/me").then(async response=>{
-      if(!response.ok) return;
+      if(!response.ok){window.sessionStorage.removeItem(DASHBOARD_CACHE_KEY);window.sessionStorage.removeItem(VIEW_CACHE_KEY);setLoggedIn(false);return}
       const data = await response.json() as {user?:{email:string;reputation?:number;isAdmin?:boolean}};
       if(data.user){setEmail(data.user.email);setReputation(data.user.reputation??80);setIsAdmin(Boolean(data.user.isAdmin));setLoggedIn(true)}
     }).finally(()=>setAuthChecking(false));
@@ -153,31 +201,27 @@ export default function Home() {
     return()=>window.clearInterval(timer);
   },[]);
 
-  const refreshDashboard=useCallback(async()=>{
-    setDataLoading(true);
+  const refreshDashboard=useCallback(async(showLoading=true)=>{
+    if(showLoading)setDataLoading(true);
     try{
       const response=await fetch("/api/dashboard");
       if(!response.ok) throw new Error("资料读取失败");
-      const data = await response.json() as {user:{email:string;reputation:number;isAdmin:boolean};profiles:Array<{type:Mode;anonymousCode:string;status:string;completion:number;payload:Record<string,string>}>;publicationLimits:Record<Mode,PublicationLimit>;readyForMatching:boolean;matches:MatchItem[];history:HistoryItem[];notifications:NotificationItem[];conversations:ConversationItem[];matchingStats:{role:number;talent:number;highScore:number;mutual:number}};
-      const nextValues:Record<string,string> = {};
-      const nextMeta:Record<Mode,ProfileMeta|undefined> = {role:undefined,talent:undefined};
-      data.profiles.forEach(profile=>{
-        nextMeta[profile.type]={anonymousCode:profile.anonymousCode,status:profile.status,completion:profile.completion,payload:profile.payload};
-        Object.entries(profile.payload).forEach(([key,value])=>nextValues[`${profile.type}-${key}`]=String(value??""));
-      });
-      setEmail(data.user.email);setReputation(data.user.reputation);setIsAdmin(data.user.isAdmin);setValues(nextValues);setProfileMeta(nextMeta);
-      setPublicationLimits(data.publicationLimits);
-      setReadyForMatching(data.readyForMatching);setMatchItems(data.matches);setHistoryItems(data.history);setNotifications(data.notifications);setConversations(data.conversations);
-      setMatchingStats(data.matchingStats);
-      if(!onboardingChecked.current){onboardingChecked.current=true;if(data.profiles.length===0)setOnboardingOpen(true)}
-    }catch{setToast("资料读取失败，请刷新后重试");setTimeout(()=>setToast(""),2600)}finally{setDataLoading(false)}
-  },[]);
+      const data = await response.json() as DashboardPayload;
+      applyDashboard(data);window.sessionStorage.setItem(DASHBOARD_CACHE_KEY,JSON.stringify({savedAt:Date.now(),data}));
+    }catch{if(showLoading){setToast("资料读取失败，请刷新后重试");setTimeout(()=>setToast(""),2600)}}finally{if(showLoading)setDataLoading(false)}
+  },[applyDashboard]);
 
   useEffect(()=>{
     if(!loggedIn) return;
-    const timer=window.setTimeout(()=>void refreshDashboard(),0);
+    const timer=window.setTimeout(()=>void refreshDashboard(!cacheHydrated.current),0);
     return()=>window.clearTimeout(timer);
   },[loggedIn,refreshDashboard]);
+
+  useEffect(()=>{
+    if(!loggedIn||!matchingPending)return;
+    const timer=window.setTimeout(()=>void refreshDashboard(false),2500);
+    return()=>window.clearTimeout(timer);
+  },[loggedIn,matchingPending,refreshDashboard]);
 
   useEffect(()=>{
     if(view!=="admin"||!isAdmin) return;
@@ -220,7 +264,7 @@ export default function Home() {
     }catch(error){flash(error instanceof Error?error.message:"保存失败，请稍后再试")}finally{setBusy(false)}
   }
 
-  async function logout(){if(!window.confirm("确定退出当前登录账号吗？"))return;await fetch("/api/auth/logout",{method:"POST"});setLoggedIn(false);setIsAdmin(false);setReputation(80);setCodeSent(false);setCode("");setValues({});setRawDrafts({role:"",talent:""});setProfileMeta({role:undefined,talent:undefined});setMatchItems([]);setHistoryItems([]);setNotifications([]);setConversations([]);flash("已安全退出")}
+  async function logout(){if(!window.confirm("确定退出当前登录账号吗？"))return;await fetch("/api/auth/logout",{method:"POST"});window.sessionStorage.removeItem(DASHBOARD_CACHE_KEY);window.sessionStorage.removeItem(VIEW_CACHE_KEY);setLoggedIn(false);setIsAdmin(false);setReputation(80);setCodeSent(false);setCode("");setValues({});setRawDrafts({role:"",talent:""});setProfileMeta({role:undefined,talent:undefined});setMatchItems([]);setHistoryItems([]);setNotifications([]);setConversations([]);setMatchingPending(false);flash("已安全退出")}
   async function changeProfileStatus(type:Mode,status:"paused"|"pooled"){
     const response=await fetch(`/api/profiles/${type}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({status})});
     const data=await response.json() as {error?:string};
@@ -282,7 +326,7 @@ export default function Home() {
     e.preventDefault();if(!activeConversation||!chatDraft.trim())return;const body=chatDraft.trim();setChatDraft("");
     const response=await fetch(`/api/conversations/${activeConversation}/messages`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({body})});
     const data=await response.json() as {error?:string;warning?:string|null;message?:ChatMessage};if(!response.ok||!data.message){flash(data.error||"发送失败");setChatDraft(body);return}
-    setChatMessages(items=>[...items,data.message!]);if(data.warning)flash(data.warning);await refreshDashboard();
+    setChatMessages(items=>[...items,data.message!]);if(data.warning)flash(data.warning);await refreshDashboard(false);
   }
   async function conversationAction(action:"cancel"|"success"){
     if(!activeConversation)return;if(action==="cancel"&&!window.confirm("取消后双方会话都会关闭，确定继续吗？"))return;
@@ -307,18 +351,23 @@ export default function Home() {
       setRawDrafts(drafts=>({...drafts,[mode]:""}));setRawOpen(false);setProfileOpen(true);flash("AI 已按语义完成分类，请确认后保存");
     }catch(error){flash(error instanceof Error?error.message:"AI 解析失败，请稍后再试")}finally{setBusy(false)}
   }
-  function nav(next:View){setView(next);window.scrollTo({top:0,behavior:"smooth"})}
+  function buttonFeedback(event:ReactMouseEvent<HTMLElement>){
+    const button=(event.target as HTMLElement).closest("button");if(!button||button.disabled)return;
+    button.classList.remove("button-feedback");void button.offsetWidth;button.classList.add("button-feedback");
+    window.setTimeout(()=>button.classList.remove("button-feedback"),650);
+  }
+  function nav(next:View){setView(next);window.sessionStorage.setItem(VIEW_CACHE_KEY,next);window.scrollTo({top:0,behavior:"smooth"})}
 
-  if(authChecking) return <main className="login-page"><div className="login-brand"><span className="brand-mark">R</span><b>Relay 接棒</b></div><section className="login-copy"><h1>正在确认<br/><em>安全登录状态…</em></h1></section></main>;
+  if(authChecking) return <main className="app-boot" aria-label="正在恢复页面"><span/></main>;
 
-  if(!loggedIn) return <main className="login-page">
+  if(!loggedIn) return <main className="login-page" onClickCapture={buttonFeedback}>
     <div className="login-brand"><span className="brand-mark">R</span><b>Relay 接棒</b></div>
     <section className="login-copy"><span className="overline">PRIVATE TALENT NETWORK</span><h1>不用海投。<br/><em>让真正做过的人帮你接棒。</em></h1><p>岗位和求职画像不会公开浏览。AI 每日理解能力、项目成果和跨行业可迁移性，只推送少量值得认真了解的匿名机会。</p><div className="login-proof"><span>Google 或邮箱登录</span><span>全程匿名沟通</span><span>反馈持续优化</span></div></section>
     <section className="login-box"><span className="step-tag">安全入口</span><h2>登录 Relay</h2><p>使用 Google 可直接进入；也可以继续使用邮箱验证码。两种方式使用相同邮箱时会自动关联为同一个账号。</p><button type="button" className="google-login" disabled={!googleAvailable||busy} onClick={()=>{window.location.href="/api/auth/google/start"}}><span className="google-mark">G</span><b>{googleAvailable?"使用 Google 账号登录":"Google 登录等待管理员配置"}</b><span>→</span></button><div className="login-divider"><span>或使用邮箱验证码</span></div><form onSubmit={login}><label>邮箱地址</label><div className="phone-input"><span>@</span><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@example.com" required disabled={codeSent||busy}/></div>{codeSent&&<><label>邮箱验证码</label><input className="code-input" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,"").slice(0,6))} inputMode="numeric" autoComplete="one-time-code" placeholder="输入邮件中的 6 位验证码" required/></>}<button disabled={busy}>{busy?"正在处理…":codeSent?"验证邮箱并进入":"发送邮箱验证码"}<span>→</span></button></form>{codeSent&&<button className="text-button" onClick={()=>{setCodeSent(false);setCode("")}}>更换邮箱或重新发送</button>}<small>邮箱验证码会真实发送，10 分钟内有效。</small></section>
     {toast&&<div className="toast">{toast}</div>}
   </main>;
 
-  return <main className="app-shell">
+  return <main className="app-shell" onClickCapture={buttonFeedback}>
     {view==="admin"&&isAdmin&&<section className="admin-refresh-panel"><div><b>全池 AI 匹配</b><span>{adminRefresh?`${adminRefresh.status==="completed"?"上次完成":"当前状态"}：已处理 ${adminRefresh.processedProfiles} 份画像，生成 ${adminRefresh.matchedCount} 条匹配`:"管理员可以随时触发增量重排"}</span></div><button className="solid" disabled={adminRefresh?.status==="running"} onClick={startAdminRefresh}>{adminRefresh?.status==="running"?"AI 正在更新…":"立即更新"}</button></section>}
     {hiddenReasonMatch&&<div className="modal-backdrop" onClick={()=>setHiddenReasonMatch(null)}><section className="hide-reason-modal" onClick={event=>event.stopPropagation()}><button className="close" onClick={()=>setHiddenReasonMatch(null)}>×</button><span className="overline">HELP AI LEARN</span><h2>这次为什么不合适？</h2><p>原因只用于优化你的后续匹配，对方不会知道。</p><div>{["行业不符合","城市不符合","薪资不符合","不接受出差","工作内容不符合","公司阶段不符合","能力差距较大","信息不够真实","只是这一次不感兴趣"].map(reason=><button key={reason} onClick={()=>decideMatch(hiddenReasonMatch,"hidden",reason)}>{reason}</button>)}</div></section></div>}
     {onboardingOpen&&<div className="modal-backdrop"><section className="onboarding-card"><span className="overline">WELCOME TO RELAY</span><h2>你今天想解决什么？</h2><p>你的资料不会公开展示，只有进入私密匹配结果的匿名用户才可能看到。</p><div><button onClick={()=>startInterview("role")}><b>我想为当前岗位找接棒人</b><span>把真实工作与经验交给下一位合适的人</span></button><button onClick={()=>startInterview("talent")}><b>我想找一个新机会</b><span>包括跨行业，把可迁移能力说清楚</span></button></div><button className="text-button" onClick={()=>{setOnboardingOpen(false);setMode("role");setProfileOpen(true)}}>跳过访谈，直接完整填写</button><button className="text-button" onClick={()=>setOnboardingOpen(false)}>暂时不发布，只看看</button></section></div>}
@@ -342,7 +391,7 @@ export default function Home() {
       <header className="topbar"><div><span className="secure-dot"/>匿名模式已开启</div><div><button className="score-pill" onClick={()=>nav("trust")}>信誉 {reputation}</button></div></header>
 
       {view==="home"&&<div className="page home-page">
-        <section className="welcome"><div><span className="overline">YOUR PRIVATE CAREER STATUS</span><h1>{hasUnreadMessage?"有人在等你的回复。":matchItems.length?`今天有 ${matchItems.length} 个机会，值得认真判断。`:draftProfile?"把真实经历说完整，下一棒才会更准。":"你的下一棒，正在私密池中寻找你。"}</h1><p>{hasUnreadMessage?"回复从真实交流开始；连续短句不会被当成有效沟通。":matchItems.length?"系统已经整理好匹配原因、风险和需要验证的事项。":readyForMatching?"画像已进入私密池，目前只等待真实用户出现。":"先选择一个目标，AI 会用访谈帮你建立画像。"}</p></div><div className="cycle"><span>距离下一次每日更新</span><b>{nextDailyCountdown.hours}<small>时</small> {nextDailyCountdown.minutes}<small>分</small></b><p>每天 00:00 更新 · 每个方向最多 10 条</p></div></section>
+        <section className="welcome"><div><span className="overline">YOUR PRIVATE CAREER STATUS</span><h1>{hasUnreadMessage?"有人在等你的回复。":matchItems.length?`今天有 ${matchItems.length} 个机会，值得认真判断。`:draftProfile?"把真实经历说完整，下一棒才会更准。":"你的下一棒，正在私密池中寻找你。"}</h1><p>{hasUnreadMessage?"回复从真实交流开始；连续短句不会被当成有效沟通。":matchItems.length?"系统已经整理好匹配原因、风险和需要验证的事项。":readyForMatching?"画像已进入私密池，目前只等待真实用户出现。":"先选择一个目标，AI 会用访谈帮你建立画像。"}</p></div><div className="welcome-side"><aside className="daily-tip"><span>今日求职 TIP · {jobDirection}</span><p>{dailyCareerTip}</p></aside><div className="cycle"><span>距离下一次每日更新</span><b>{nextDailyCountdown.hours}<small>时</small> {nextDailyCountdown.minutes}<small>分</small></b><p>每天 00:00 更新 · 最多展示 10 条</p></div></div></section>
         <section className="home-focus"><span className="card-index">NEXT BEST ACTION</span><h2>{hasUnreadMessage?"回复匿名消息":matchItems.length?"查看今日匹配":draftProfile?"继续确认画像":"开始建立第一份画像"}</h2><p>{hasUnreadMessage?`你有 ${unreadCount} 条未读通知。`:matchItems.length?`其中 ${matchingStats.highScore} 条达到 90 分以上，${matchingStats.mutual} 条已经双方互选。`:draftProfile?`当前画像完成度 ${profileMeta[draftProfile]?.completion??0}%，补齐项目成果与可验证信息后再入池。`:"可以选择 AI 访谈，也可以跳过访谈直接填写完整表单。"}</p><button className="solid home-main-cta" onClick={()=>{if(hasUnreadMessage)nav("notifications");else if(matchItems.length)nav("matches");else if(draftProfile){setMode(draftProfile);setProfileOpen(true)}else setOnboardingOpen(true)}}>{hasUnreadMessage?"去回复":matchItems.length?"查看匹配":"开始"} <span>→</span></button></section>
         <section className="home-results"><div><span>找接棒人方向</span><b>{matchingStats.role}</b></div><div><span>找工作方向</span><b>{matchingStats.talent}</b></div><div><span>90 分以上</span><b>{matchingStats.highScore}</b></div><div><span>双方互选</span><b>{matchingStats.mutual}</b></div></section>
         <section className="home-secondary"><button onClick={()=>startInterview("role")}>+ 发布或更新接棒岗位</button><button onClick={()=>startInterview("talent")}>+ 发布或更新找工作画像</button><button onClick={()=>nav("posts")}>管理我的发布</button></section>
@@ -350,7 +399,7 @@ export default function Home() {
 
       {view==="posts"&&<div className="page posts-page"><div className="page-heading"><div><span className="overline">MY PRIVATE POSTS</span><h1>我的发布</h1><p>两个方向分别管理：每月各可删除一次，删除后各可重新新建一次；暂停和恢复不限次数。</p></div><div className="post-limit"><b>{Object.values(profileMeta).filter(Boolean).length} / 2</b><span>当前有效发布</span></div></div><div className="post-cards">{(["role","talent"] as Mode[]).map(item=>{const profile=profileMeta[item];const limit=publicationLimits[item];return profile?<article key={item}><header><span>{profile.anonymousCode}</span><i>{profile.status==="paused"?"已暂停":"匹配中"}</i></header><h2>{item==="role"?"我的待接棒岗位":"我的找工作画像"}</h2><p>{item==="role"?[profile.payload.city,profile.payload.role,profile.payload.industry].filter(Boolean).join(" · "):[profile.payload.industry,profile.payload.city,profile.payload.salary].filter(Boolean).join(" · ")}</p><div className="post-meta"><span>画像完整度 <b>{profile.completion}%</b></span><span>今日匹配 <b>{matchItems.filter(match=>match.perspective===item).length}</b></span></div><div><button className="solid" onClick={()=>{setMode(item);setProfileOpen(true)}}>{item==="role"?"修改接棒信息":"修改求职信息"}</button><button className="outline" onClick={()=>changeProfileStatus(item,profile.status==="paused"?"pooled":"paused")}>{profile.status==="paused"?"恢复入池":"暂停入池"}</button><button className="danger" disabled={!limit.canDelete} onClick={()=>deleteProfile(item)}>{limit.canDelete?"删除发布":"本月已删除过"}</button></div></article>:<article className="empty-post" key={item}><span className="card-index">{item==="role"?"ROLE POST":"TALENT POST"}</span><h2>{item==="role"?"还没有待接棒岗位":"还没有求职画像"}</h2><p>{limit.canRecreate?(item==="role"?"提交真实岗位信息后，立即进行首次AI匹配。":"提交能力与求职偏好后，立即进行首次AI匹配。"):`该方向本月的新建次数已用完，下月可再次发布。`}</p><button className="solid" disabled={!limit.canRecreate} onClick={()=>{setMode(item);setProfileOpen(true)}}>{limit.canRecreate?"立即发布":"本月不可再新建"}</button></article>})}</div><div className="one-post-rule"><b>匹配什么时候更新？</b><p>首次发布立即匹配；之后每天更新一次。修改、收藏、想了解和隐藏原因都会进入下一轮AI排序。</p></div></div>}
 
-      {view==="matches"&&<div className="page"><div className="page-heading"><div><span className="overline">PRIVATE DAILY AI SELECTION</span><h1>今日匹配</h1><p>AI结合能力、项目成果、硬性条件、跨行业可迁移性和你的历史选择进行排序。</p></div><div className="week-count"><b>{String(matchItems.length).padStart(2,"0")}</b><span>/ 10 个今日机会</span></div></div>{dataLoading?<div className="empty-state"><h2>AI正在读取今日匹配…</h2></div>:!readyForMatching?<div className="empty-state"><span>✦</span><h2>匹配尚未开启</h2><p>请先发布“找工作”或“找接任者”任意一条信息。</p><button className="solid" onClick={()=>nav("posts")}>去完成我的发布</button></div>:matchItems.length===0?<div className="empty-state"><span>○</span><h2>今天还没有合适结果</h2><p>你的画像已进入私密池。系统不会为了凑满十条而展示明显不合适的机会。</p></div>:<div className="matches-list">{matchItems.map(m=>{const paired=m.ownDecision==="interested"&&m.otherDecision==="interested";return <article className={`match-row ${m.ownDecision==="hidden"?"is-hidden":""}`} key={m.id}><div className="score-block"><b>{m.score}</b><span>匹配度</span><i>{m.score>=90?"高度匹配":m.score>=75?"值得了解":"探索机会"}</i></div><div className="match-body"><div className="match-title"><div><h2>{m.perspective==="talent"?`匿名岗位 ${m.anonymousCode}`:`匿名候选人 ${m.anonymousCode}`}</h2><p>{[m.payload.city,m.payload.role||m.payload.industry,m.payload.system||m.payload.salary].filter(Boolean).join(" · ")}</p></div><span className="verified">✓ 对方邮箱已验证</span></div><div className="match-reasons"><div><b>为什么值得聊</b><p>{m.reasons.join("；")}</p></div><div className="risk"><b>最大分歧与风险</b><p>{m.risks.join("；")}</p></div><div><b>沟通时应验证</b><p>{m.verifyOnMeeting.join("；")}</p></div></div><div className="match-actions"><button className={paired?"paired":m.ownDecision==="interested"?"liked":""} disabled={m.ownDecision==="hidden"} onClick={()=>paired&&m.conversationId?openConversation(m.conversationId):decideMatch(m.id,m.ownDecision==="interested"?"pending":"interested")}>{paired?"已配对 ✓":m.ownDecision==="interested"?"已发出意向 ✓":"想了解"}</button><button className={m.favorite?"favorite active":"favorite"} disabled={m.ownDecision==="hidden"} onClick={()=>toggleFavorite(m.id,!m.favorite)}>{m.favorite?"已收藏 ★":"收藏 ☆"}</button><button className={m.ownDecision==="hidden"?"hidden-btn":""} onClick={()=>m.ownDecision==="hidden"?decideMatch(m.id,"pending"):setHiddenReasonMatch(m.id)}>{m.ownDecision==="hidden"?"已隐藏·点击撤回":"暂时隐藏"}</button></div></div></article>})}</div>}</div>}
+      {view==="matches"&&<div className="page"><div className="page-heading"><div><span className="overline">PRIVATE DAILY AI SELECTION</span><h1>今日匹配</h1><p>AI结合能力、项目成果、硬性条件、跨行业可迁移性和你的历史选择进行排序。</p></div><div className="week-count"><b>{String(matchItems.length).padStart(2,"0")}</b><span>/ 10 个今日机会</span></div></div><div className="match-category-tabs"><button className={effectiveMatchCategory==="talent"?"active":""} onClick={()=>setMatchCategory("talent")}>找工作画像 <span>{matchItems.filter(item=>item.perspective==="talent").length}</span></button><button className={effectiveMatchCategory==="role"?"active":""} onClick={()=>setMatchCategory("role")}>找候选人画像 <span>{matchItems.filter(item=>item.perspective==="role").length}</span></button>{matchingPending&&<i>后台正在更新今日结果…</i>}</div>{dataLoading&&!cacheHydrated.current?<div className="empty-state"><h2>正在读取今日匹配…</h2></div>:!readyForMatching?<div className="empty-state"><span>✦</span><h2>匹配尚未开启</h2><p>请先发布“找工作”或“找接任者”任意一条信息。</p><button className="solid" onClick={()=>nav("posts")}>去完成我的发布</button></div>:matchItems.length===0?<div className="empty-state"><span>○</span><h2>今天还没有合适结果</h2><p>你的画像已进入私密池。系统不会为了凑满十条而展示明显不合适的机会。</p></div>:visibleMatchItems.length===0?<div className="empty-state"><span>○</span><h2>{effectiveMatchCategory==="talent"?"今天还没有合适岗位":"今天还没有合适候选人"}</h2><p>另一个分类可能已经有结果；新的真实画像进入后，系统会在后台更新。</p></div>:<div className="matches-list">{visibleMatchItems.map(m=>{const paired=m.ownDecision==="interested"&&m.otherDecision==="interested";return <article className={`match-row ${m.ownDecision==="hidden"?"is-hidden":""}`} key={m.id}><div className="score-block"><b>{m.score}</b><span>匹配度</span><i>{m.score>=90?"高度匹配":m.score>=75?"值得了解":"探索机会"}</i></div><div className="match-body"><div className="match-title"><div><h2>{m.perspective==="talent"?`匿名岗位 ${m.anonymousCode}`:`匿名候选人 ${m.anonymousCode}`}</h2><p>{[m.payload.city,m.payload.role||m.payload.industry,m.payload.system||m.payload.salary].filter(Boolean).join(" · ")}</p></div><span className="verified">✓ 对方邮箱已验证</span></div><div className="match-reasons"><div><b>为什么值得聊</b><p>{m.reasons.join("；")}</p></div><div className="risk"><b>最大分歧与风险</b><p>{m.risks.join("；")}</p></div><div><b>沟通时应验证</b><p>{m.verifyOnMeeting.join("；")}</p></div></div><div className="match-actions"><button className={paired?"paired":m.ownDecision==="interested"?"liked":""} disabled={m.ownDecision==="hidden"} onClick={()=>paired&&m.conversationId?openConversation(m.conversationId):decideMatch(m.id,m.ownDecision==="interested"?"pending":"interested")}>{paired?"已配对 ✓":m.ownDecision==="interested"?"已发出意向 ✓":"想了解"}</button><button className={m.favorite?"favorite active":"favorite"} disabled={m.ownDecision==="hidden"} onClick={()=>toggleFavorite(m.id,!m.favorite)}>{m.favorite?"已收藏 ★":"收藏 ☆"}</button><button className={m.ownDecision==="hidden"?"hidden-btn":""} onClick={()=>m.ownDecision==="hidden"?decideMatch(m.id,"pending"):setHiddenReasonMatch(m.id)}>{m.ownDecision==="hidden"?"已隐藏·点击撤回":"暂时隐藏"}</button></div></div></article>})}</div>}</div>}
 
       {view==="history"&&<div className="page history-page"><div className="page-heading"><div><span className="overline">MATCH HISTORY</span><h1>历史匹配</h1><p>这里保留以前日期的真实匹配结果；已隐藏对象不会再次进入你的候选池。</p></div></div>{historyItems.length===0?<div className="empty-state"><span>◷</span><h2>还没有历史匹配</h2><p>新账号不会显示测试数据。每日更新后，以前的真实匹配会出现在这里。</p></div>:<div className="history-list">{historyItems.map(item=><article key={item.id}><div><span>{item.weekKey}</span><h2>{item.perspective==="talent"?"匿名岗位":"匿名候选人"} {item.anonymousCode}</h2><p>{item.outcome==="success"?"匹配成功":item.outcome==="failed"?"匹配失败或已隐藏":"本轮已结束"} · 匹配度 {item.score} 分</p></div><i className={item.outcome}>{item.outcome==="success"?"成功":item.outcome==="failed"?"失败":"已结束"}</i>{item.reviewAvailable&&<button className="outline" onClick={()=>flash("评价与追评将在评价功能上线后开放")}>评价 / 追评</button>}</article>)}</div>}</div>}
 

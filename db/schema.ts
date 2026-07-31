@@ -86,6 +86,7 @@ export const matchRuns = sqliteTable("match_runs", {
   profileId: text("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
   weekKey: text("week_key").notNull(),
   contentVersion: integer("content_version").notNull(),
+  status: text("status", { enum: ["running", "completed", "failed"] }).notNull().default("completed"),
   candidateCount: integer("candidate_count").notNull().default(0),
   matchedCount: integer("matched_count").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),

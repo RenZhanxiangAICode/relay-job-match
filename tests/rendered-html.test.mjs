@@ -23,15 +23,16 @@ async function render() {
   );
 }
 
-test("server-renders the Relay email-login shell", async () => {
+test("server-renders the Relay page-restoration shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
   assert.match(html, /<title>Relay 接棒 — 私密 AI 职业匹配<\/title>/i);
-  assert.match(html, /正在确认/);
-  assert.match(html, /安全登录状态/);
+  assert.match(html, /class="app-boot"/);
+  assert.match(html, /正在恢复页面/);
+  assert.doesNotMatch(html, /安全登录状态/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -82,10 +83,11 @@ test("supports Google OAuth while keeping email verification", async () => {
 });
 
 test("uses indexed incremental matching and per-direction monthly limits", async () => {
-  const [worker, schema, page] = await Promise.all([
+  const [worker, schema, page, css] = await Promise.all([
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
 
   assert.match(worker, /JOIN profile_keywords other ON other\.keyword = mine\.keyword/);
@@ -121,6 +123,17 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /已配对/);
   assert.match(page, /本次匹配信息/);
   assert.match(page, /正在进入匿名沟通/);
+  assert.match(page, /DASHBOARD_CACHE_KEY/);
+  assert.match(page, /sessionStorage/);
+  assert.match(page, /找工作画像/);
+  assert.match(page, /找候选人画像/);
+  assert.match(page, /今日求职 TIP/);
+  assert.match(page, /data\.matches\.slice\(0,10\)/);
+  assert.match(worker, /ctx\.waitUntil\(ensureDailyMatchesForUser/);
+  assert.match(worker, /\.sort\(\(a, b\) => Number\(b\.score\) - Number\(a\.score\)\)\.slice\(0, 10\)/);
+  assert.match(schema, /status: text\("status", \{ enum: \["running", "completed", "failed"\]/);
+  assert.match(css, /overflow-wrap:anywhere/);
+  assert.match(css, /button-feedback/);
   assert.doesNotMatch(page, /await refreshDashboard\(\);\s*setHiddenReasonMatch/);
   assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, cycles\] = await Promise\.all/);
   assert.match(worker, /mutual: ownDecision === "interested"/);

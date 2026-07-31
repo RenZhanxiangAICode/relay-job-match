@@ -512,8 +512,8 @@ async function runMatchForProfile(env: Env, profileId: string, force = false) {
   `).bind(profileId).first<{ id: string; userId: string; type: "role" | "talent"; payload: string; embedding: string; contentVersion: number; status: string }>();
   if (!profile || profile.status !== "pooled") return { candidates: 0, matches: 0 };
   const currentCycle = matchCycleKey();
-  const previous = await env.DB.prepare("SELECT content_version AS contentVersion FROM match_runs WHERE profile_id = ? AND week_key = ?")
-    .bind(profileId, currentCycle).first<{ contentVersion: number }>();
+  const previous = await env.DB.prepare("SELECT content_version AS contentVersion, status FROM match_runs WHERE profile_id = ? AND week_key = ?")
+    .bind(profileId, currentCycle).first<{ contentVersion: number; status: string }>();
   if (previous && !force) return { candidates: 0, matches: 0 };
 
   const opposite = profile.type === "role" ? "talent" : "role";
@@ -577,10 +577,10 @@ async function runMatchForProfile(env: Env, profileId: string, force = false) {
     matchedCount += 1;
   }
   await env.DB.prepare(`
-    INSERT INTO match_runs (profile_id, week_key, content_version, candidate_count, matched_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO match_runs (profile_id, week_key, content_version, status, candidate_count, matched_count, created_at)
+    VALUES (?, ?, ?, 'completed', ?, ?, ?)
     ON CONFLICT(profile_id, week_key) DO UPDATE SET content_version = excluded.content_version,
-      candidate_count = excluded.candidate_count, matched_count = excluded.matched_count, created_at = excluded.created_at
+      status = 'completed', candidate_count = excluded.candidate_count, matched_count = excluded.matched_count, created_at = excluded.created_at
   `).bind(profileId, currentCycle, profile.contentVersion, candidateRows.length, matchedCount, now).run();
   await env.DB.prepare("UPDATE profiles SET last_matched_week = ? WHERE id = ?").bind(currentCycle, profileId).run();
   return { candidates: candidateRows.length, matches: matchedCount };
@@ -588,27 +588,36 @@ async function runMatchForProfile(env: Env, profileId: string, force = false) {
 
 async function ensureDailyMatchesForUser(env: Env, userId: string) {
   const currentCycle = matchCycleKey();
-  const due = await env.DB.prepare(`
-    SELECT p.id FROM profiles p
+  const dueProfiles = await env.DB.prepare(`
+    SELECT p.id, p.type, p.payload, p.search_text AS searchText, p.content_version AS contentVersion FROM profiles p
     LEFT JOIN match_runs r ON r.profile_id = p.id AND r.week_key = ?
-    WHERE p.user_id = ? AND p.status = 'pooled' AND r.profile_id IS NULL
-    LIMIT 1
-  `).bind(currentCycle, userId).first<{ id: string }>();
-  if (!due) return;
+    WHERE p.user_id = ? AND p.status = 'pooled' AND (r.profile_id IS NULL OR r.status = 'failed')
+  `).bind(currentCycle, userId).all<{ id: string; type: "role" | "talent"; payload: string; searchText: string; contentVersion: number }>();
+  if (dueProfiles.results.length === 0) return;
   await finalizeHiddenExclusions(env, userId, currentCycle);
-  const profiles = await env.DB.prepare(`
-    SELECT id, type, payload, search_text AS searchText FROM profiles WHERE user_id = ? AND status = 'pooled'
-  `).bind(userId).all<{ id: string; type: "role" | "talent"; payload: string; searchText: string }>();
   let generated = 0;
-  for (const profile of profiles.results) {
-    if (!profile.searchText) {
-      const index = buildProfileIndex(JSON.parse(profile.payload));
-      await env.DB.prepare("UPDATE profiles SET search_text = ?, embedding = ? WHERE id = ?")
-        .bind(index.searchText, JSON.stringify(vectorize(index.searchText)), profile.id).run();
-      await syncProfileIndex(env, profile.id, profile.type, index.keywords);
+  for (const profile of dueProfiles.results) {
+    const claimed = await env.DB.prepare(`
+      INSERT INTO match_runs (profile_id, week_key, content_version, status, candidate_count, matched_count, created_at)
+      VALUES (?, ?, ?, 'running', 0, 0, ?)
+      ON CONFLICT(profile_id, week_key) DO UPDATE SET status = 'running', created_at = excluded.created_at
+      WHERE match_runs.status = 'failed'
+    `).bind(profile.id, currentCycle, profile.contentVersion, Math.floor(Date.now() / 1000)).run();
+    if (!claimed.meta.changes) continue;
+    try {
+      if (!profile.searchText) {
+        const index = buildProfileIndex(JSON.parse(profile.payload));
+        await env.DB.prepare("UPDATE profiles SET search_text = ?, embedding = ? WHERE id = ?")
+          .bind(index.searchText, JSON.stringify(vectorize(index.searchText)), profile.id).run();
+        await syncProfileIndex(env, profile.id, profile.type, index.keywords);
+      }
+      const result = await runMatchForProfile(env, profile.id, true);
+      generated += result.matches;
+    } catch (error) {
+      console.error("Daily matching failed", profile.id, error);
+      await env.DB.prepare("UPDATE match_runs SET status = 'failed' WHERE profile_id = ? AND week_key = ?")
+        .bind(profile.id, currentCycle).run();
     }
-    const result = await runMatchForProfile(env, profile.id);
-    generated += result.matches;
   }
   if (generated > 0) await createNotification(env, { userId, type: "matches_ready", title: "今日匹配结果已生成", body: `系统为你的有效画像更新了 ${generated} 条候选结果，请查看匹配原因与风险。`, dedupeKey: `matches:${currentCycle}:${userId}` });
 }
@@ -784,10 +793,10 @@ async function createNotification(env: Env, input: { userId: string; type: strin
   `).bind(crypto.randomUUID(), input.userId, input.type, input.title, input.body, input.targetId ?? null, input.dedupeKey, Math.floor(Date.now() / 1000)).run();
 }
 
-async function dashboardApi(request: Request, env: Env) {
+async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   const auth = await requireUser(request, env);
   if (auth.response || !auth.user) return auth.response!;
-  await ensureDailyMatchesForUser(env, auth.user.id);
+  ctx.waitUntil(ensureDailyMatchesForUser(env, auth.user.id));
   const profiles = await env.DB.prepare(`
     SELECT id, type, anonymous_code AS anonymousCode, payload, completion, status, updated_at AS updatedAt
     FROM profiles WHERE user_id = ? AND status <> 'removed' ORDER BY type
@@ -869,7 +878,13 @@ async function dashboardApi(request: Request, env: Env) {
   const matches = [
     ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
     ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
-  ].sort((a, b) => Number(b.score) - Number(a.score));
+  ].sort((a, b) => Number(b.score) - Number(a.score)).slice(0, 10);
+  const matchingPending = readyForMatching ? Boolean(await env.DB.prepare(`
+    SELECT 1 AS pending FROM profiles p
+    LEFT JOIN match_runs r ON r.profile_id = p.id AND r.week_key = ?
+    WHERE p.user_id = ? AND p.status = 'pooled' AND (r.profile_id IS NULL OR r.status <> 'completed')
+    LIMIT 1
+  `).bind(matchCycleKey(), auth.user.id).first<{ pending: number }>()) : false;
   const conversationItems = conversations.results.map((row) => {
     const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
     return {
@@ -901,7 +916,7 @@ async function dashboardApi(request: Request, env: Env) {
 
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, publicationLimits, readyForMatching, matches, history, notifications: notificationRows.results, conversations: conversationItems,
+    profiles: profileRows, publicationLimits, readyForMatching, matchingPending, matches, history, notifications: notificationRows.results, conversations: conversationItems,
     matchingStats: {
       role: matches.filter((match) => match.perspective === "role").length,
       talent: matches.filter((match) => match.perspective === "talent").length,
@@ -1206,7 +1221,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (profileLifecycleMatch && (request.method === "PATCH" || request.method === "DELETE")) {
     return profileLifecycleApi(request, env, profileLifecycleMatch[1] as "role" | "talent");
   }
-  if (pathname === "/api/dashboard" && request.method === "GET") return dashboardApi(request, env);
+  if (pathname === "/api/dashboard" && request.method === "GET") return dashboardApi(request, env, ctx);
   const decisionMatch = pathname.match(/^\/api\/matches\/([^/]+)\/decision$/);
   if (decisionMatch && request.method === "PUT") return matchDecisionApi(request, env, decisionMatch[1]);
   const favoriteMatch = pathname.match(/^\/api\/matches\/([^/]+)\/favorite$/);

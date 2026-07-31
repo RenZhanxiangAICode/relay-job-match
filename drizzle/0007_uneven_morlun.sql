@@ -1,0 +1,1 @@
+ALTER TABLE `match_runs` ADD `status` text DEFAULT 'completed' NOT NULL;
