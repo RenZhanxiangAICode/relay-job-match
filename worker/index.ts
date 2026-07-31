@@ -879,7 +879,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   const matches = [
     ...allMatches.filter((match) => match.perspective === "role").slice(0, 10),
     ...allMatches.filter((match) => match.perspective === "talent").slice(0, 10),
-  ].sort((a, b) => Number(b.score) - Number(a.score)).slice(0, 10);
+  ].sort((a, b) => Number(b.score) - Number(a.score));
   const matchingPending = readyForMatching ? Boolean(await env.DB.prepare(`
     SELECT 1 AS pending FROM profiles p
     LEFT JOIN match_runs r ON r.profile_id = p.id AND r.week_key = ?

@@ -132,9 +132,11 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /找工作画像/);
   assert.match(page, /找候选人画像/);
   assert.match(page, /今日求职 TIP/);
-  assert.match(page, /data\.matches\.slice\(0,10\)/);
+  assert.match(page, /setMatchItems\(data\.matches\)/);
+  assert.match(page, /两个方向各最多 10 条/);
   assert.match(worker, /ctx\.waitUntil\(ensureDailyMatchesForUser/);
-  assert.match(worker, /\.sort\(\(a, b\) => Number\(b\.score\) - Number\(a\.score\)\)\.slice\(0, 10\)/);
+  assert.match(worker, /\.\.\.allMatches\.filter\(\(match\) => match\.perspective === "role"\)\.slice\(0, 10\)/);
+  assert.match(worker, /\.\.\.allMatches\.filter\(\(match\) => match\.perspective === "talent"\)\.slice\(0, 10\)/);
   assert.match(schema, /status: text\("status", \{ enum: \["running", "completed", "failed"\]/);
   assert.match(css, /overflow-wrap:anywhere/);
   assert.match(css, /button-feedback/);
