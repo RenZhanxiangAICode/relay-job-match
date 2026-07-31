@@ -493,7 +493,7 @@ async function finalizeHiddenExclusions(env: Env, userId: string, currentWeek: s
     FROM matches m
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
-    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
+    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?) AND c.id IS NOT NULL
       AND (m.role_decision = 'hidden' OR m.talent_decision = 'hidden')
   `).bind(currentWeek, userId, userId).all<{ roleProfileId: string; talentProfileId: string }>();
   const now = Math.floor(Date.now() / 1000);

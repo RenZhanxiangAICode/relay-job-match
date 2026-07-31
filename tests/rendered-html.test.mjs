@@ -107,6 +107,8 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /暂停入池/);
   assert.match(page, /本月已删除过/);
   assert.match(page, /历史匹配/);
+  assert.match(page, /这里只保留双方已经成功配对并建立匿名会话的历史记录/);
+  assert.match(worker, /AND c\.id IS NOT NULL/);
   assert.match(page, /确定退出当前登录账号吗/);
   assert.match(page, /\/api\/ai\/parse-profile/);
   assert.match(page, /岗位项目经验与产出/);
