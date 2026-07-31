@@ -493,7 +493,7 @@ async function finalizeHiddenExclusions(env: Env, userId: string, currentWeek: s
     FROM matches m
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
-    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?) AND c.id IS NOT NULL
+    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
       AND (m.role_decision = 'hidden' OR m.talent_decision = 'hidden')
   `).bind(currentWeek, userId, userId).all<{ roleProfileId: string; talentProfileId: string }>();
   const now = Math.floor(Date.now() / 1000);
@@ -843,14 +843,15 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     SELECT m.id, m.week_key AS weekKey, m.score, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
       rp.user_id AS roleUserId, rp.anonymous_code AS roleCode,
       tp.user_id AS talentUserId, tp.anonymous_code AS talentCode,
-      c.id AS conversationId
+      c.id AS conversationId, c.status AS conversationStatus
     FROM matches m
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
-    LEFT JOIN conversations c ON c.match_id = m.id
-    WHERE m.week_key <> ? AND (rp.user_id = ? OR tp.user_id = ?)
-    ORDER BY m.week_key DESC, m.score DESC LIMIT 100
-  `).bind(matchCycleKey(), auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
+    JOIN conversations c ON c.match_id = m.id
+    WHERE (rp.user_id = ? OR tp.user_id = ?)
+      AND m.role_decision = 'interested' AND m.talent_decision = 'interested'
+    ORDER BY c.created_at DESC
+  `).bind(auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
 
   const cyclesPromise = env.DB.prepare(`
     SELECT type, delete_count AS deleteCount, recreate_count AS recreateCount
@@ -896,13 +897,11 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   });
   const history = historyRows.results.map((row) => {
     const isRole = row.roleUserId === auth.user.id;
-    const ownDecision = String(isRole ? row.roleDecision : row.talentDecision);
-    const otherDecision = String(isRole ? row.talentDecision : row.roleDecision);
-    const outcome = row.conversationId ? "success" : ownDecision === "hidden" || otherDecision === "hidden" ? "failed" : ownDecision === "interested" && otherDecision === "interested" ? "success" : "ended";
     return {
-      id: row.id, weekKey: row.weekKey, score: row.score, outcome,
+      id: row.id, weekKey: row.weekKey, score: row.score, outcome: "success",
       anonymousCode: isRole ? row.talentCode : row.roleCode,
-      perspective: isRole ? "role" : "talent", reviewAvailable: Boolean(row.conversationId),
+      perspective: isRole ? "role" : "talent", reviewAvailable: true,
+      conversationId: row.conversationId, conversationStatus: row.conversationStatus,
     };
   });
 
