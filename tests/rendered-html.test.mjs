@@ -150,7 +150,9 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(schema, /status: text\("status", \{ enum: \["running", "completed", "failed"\]/);
   assert.match(css, /overflow-wrap:anywhere/);
   assert.match(css, /button-feedback/);
-  assert.match(css, /body\{font-size:16px;line-height:1\.65\}/);
+  assert.match(css, /--type-body:clamp\(16px/);
+  assert.match(css, /font-family:-apple-system,BlinkMacSystemFont/);
+  assert.match(css, /--type-hero:clamp\(42px/);
   assert.match(css, /match-category-tabs button\.active\{background:var\(--ink\);color:white/);
   assert.doesNotMatch(page, /await refreshDashboard\(\);\s*setHiddenReasonMatch/);
   assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, cycles, poolRows\] = await Promise\.all/);
