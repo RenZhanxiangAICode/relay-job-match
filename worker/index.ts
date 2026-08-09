@@ -810,10 +810,13 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
       m.role_favorite AS roleFavorite, m.talent_favorite AS talentFavorite, m.algorithm_version AS algorithmVersion,
       rp.user_id AS roleUserId, rp.anonymous_code AS roleCode, rp.payload AS rolePayload,
       tp.user_id AS talentUserId, tp.anonymous_code AS talentCode, tp.payload AS talentPayload,
+      ru.reputation AS roleReputation, tu.reputation AS talentReputation,
       c.id AS conversationId
     FROM matches m
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
+    JOIN users ru ON ru.id = rp.user_id
+    JOIN users tu ON tu.id = tp.user_id
     LEFT JOIN conversations c ON c.match_id = m.id
     WHERE m.week_key = ? AND (rp.user_id = ? OR tp.user_id = ?)
     ORDER BY m.score DESC LIMIT 40
@@ -825,7 +828,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   `).bind(auth.user.id).all<Record<string, string | number | null>>();
 
   const conversationsPromise = env.DB.prepare(`
-    SELECT c.id, c.match_id AS matchId, c.status,
+    SELECT c.id, c.match_id AS matchId, c.status, c.created_at AS createdAt,
       CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
       m.score, rp.user_id AS roleUserId, rp.payload AS rolePayload, tp.payload AS talentPayload,
       m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
@@ -858,8 +861,14 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     FROM publication_cycles WHERE user_id = ? AND month_key = ?
   `).bind(auth.user.id, monthKey()).all<{ type: "role" | "talent"; deleteCount: number; recreateCount: number }>();
 
-  const [matchRows, notificationRows, conversations, historyRows, cycles] = await Promise.all([
-    matchRowsPromise, notificationRowsPromise, conversationsPromise, historyRowsPromise, cyclesPromise,
+  const poolStatsPromise = env.DB.prepare(`
+    SELECT type, COUNT(*) AS count FROM profiles
+    WHERE status = 'pooled' AND user_id <> ?
+    GROUP BY type
+  `).bind(auth.user.id).all<{ type: "role" | "talent"; count: number }>();
+
+  const [matchRows, notificationRows, conversations, historyRows, cycles, poolRows] = await Promise.all([
+    matchRowsPromise, notificationRowsPromise, conversationsPromise, historyRowsPromise, cyclesPromise, poolStatsPromise,
   ]);
 
   const allMatches = matchRows.results.map((row) => {
@@ -870,6 +879,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     const favorite = Boolean(Number(perspective === "role" ? row.roleFavorite : row.talentFavorite));
     return {
       id: row.id, score: row.score, perspective, ownDecision, otherDecision, favorite, algorithmVersion: row.algorithmVersion,
+      reputation: Number(perspective === "role" ? row.talentReputation : row.roleReputation),
       anonymousCode: perspective === "role" ? row.talentCode : row.roleCode,
       payload: opposingPayload,
       reasons: JSON.parse(String(row.reasons)), risks: JSON.parse(String(row.risks)),
@@ -889,7 +899,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   const conversationItems = conversations.results.map((row) => {
     const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
     return {
-      id: row.id, matchId: row.matchId, status: row.status, anonymousCode: row.anonymousCode, score: row.score,
+      id: row.id, matchId: row.matchId, status: row.status, createdAt: row.createdAt, anonymousCode: row.anonymousCode, score: row.score,
       lastMessage: row.lastMessage, messageCount: row.messageCount, perspective,
       payload: JSON.parse(String(perspective === "role" ? row.talentPayload : row.rolePayload)),
       reasons: JSON.parse(String(row.reasons)), risks: JSON.parse(String(row.risks)), verifyOnMeeting: JSON.parse(String(row.verifyOnMeeting)),
@@ -912,10 +922,12 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
   for (const cycle of cycles.results) {
     publicationLimits[cycle.type] = { canDelete: cycle.deleteCount < 1, canRecreate: cycle.recreateCount < 1 };
   }
+  const poolStats = { role: 0, talent: 0 };
+  for (const row of poolRows.results) poolStats[row.type] = Number(row.count);
 
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, publicationLimits, readyForMatching, matchingPending, matches, history, notifications: notificationRows.results, conversations: conversationItems,
+    profiles: profileRows, publicationLimits, readyForMatching, matchingPending, matches, history, notifications: notificationRows.results, conversations: conversationItems, poolStats,
     matchingStats: {
       role: matches.filter((match) => match.perspective === "role").length,
       talent: matches.filter((match) => match.perspective === "talent").length,
@@ -1003,7 +1015,7 @@ async function startConversationApi(request: Request, env: Env) {
     WHERE m.id = ?
   `).bind(matchId).first<{ id: string; roleDecision: string; talentDecision: string; roleUserId: string; talentUserId: string }>();
   if (!match || (match.roleUserId !== auth.user.id && match.talentUserId !== auth.user.id)) return json({ error: "匹配不存在" }, 404);
-  if (match.roleDecision !== "interested" || match.talentDecision !== "interested") return json({ error: "只有双方匹配成功后才能开始沟通" }, 409);
+  if (match.roleDecision !== "interested" || match.talentDecision !== "interested") return json({ error: "只有双方都点击“想了解”后才能开始沟通" }, 409);
   const existing = await env.DB.prepare("SELECT id FROM conversations WHERE match_id = ?").bind(matchId).first<{ id: string }>();
   const id = existing?.id ?? crypto.randomUUID();
   if (!existing) {
@@ -1016,7 +1028,7 @@ async function startConversationApi(request: Request, env: Env) {
 
 async function conversationContext(env: Env, conversationId: string, userId: string) {
   return env.DB.prepare(`
-    SELECT c.id, c.status, c.success_requested_by AS successRequestedBy, m.id AS matchId, m.score,
+    SELECT c.id, c.status, c.created_at AS createdAt, c.success_requested_by AS successRequestedBy, m.id AS matchId, m.score,
       rp.user_id AS roleUserId, tp.user_id AS talentUserId,
       CASE WHEN rp.user_id = ? THEN tp.user_id ELSE rp.user_id END AS otherUserId,
       CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
@@ -1036,7 +1048,7 @@ async function conversationMessagesApi(request: Request, env: Env, conversationI
   if (request.method === "GET") {
     const rows = await env.DB.prepare(`SELECT id, sender_id AS senderId, body, created_at AS createdAt FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500`)
       .bind(conversationId).all<Record<string, string | number>>();
-    return json({ conversation: { id: conversationId, matchId: context.matchId, status: context.status, anonymousCode: context.anonymousCode, score: context.score, perspective: context.roleUserId === auth.user.id ? "role" : "talent", payload: JSON.parse(String(context.opposingPayload)), reasons: JSON.parse(String(context.reasons)), risks: JSON.parse(String(context.risks)), verifyOnMeeting: JSON.parse(String(context.verifyOnMeeting)), successRequestedByMe: context.successRequestedBy === auth.user.id, messageCount: rows.results.length }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
+    return json({ conversation: { id: conversationId, matchId: context.matchId, status: context.status, createdAt: context.createdAt, anonymousCode: context.anonymousCode, score: context.score, perspective: context.roleUserId === auth.user.id ? "role" : "talent", payload: JSON.parse(String(context.opposingPayload)), reasons: JSON.parse(String(context.reasons)), risks: JSON.parse(String(context.risks)), verifyOnMeeting: JSON.parse(String(context.verifyOnMeeting)), successRequestedByMe: context.successRequestedBy === auth.user.id, messageCount: rows.results.length }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
   }
   if (request.method !== "POST") return json({ error: "不支持的请求" }, 405);
   if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
