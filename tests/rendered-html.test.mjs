@@ -131,6 +131,9 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /sessionStorage/);
   assert.match(page, /我想找工作/);
   assert.match(page, /我想找接棒人/);
+  assert.match(page, /const effectiveMatchCategory = matchCategory/);
+  assert.match(page, /primaryHomeState==="message"\)return nav\("messages"\)/);
+  assert.match(page, /去匿名沟通/);
   assert.match(page, /今日求职 TIP/);
   assert.match(page, /YOUR NEXT BEST ACTION/);
   assert.match(page, /查看 AI 匹配分析/);
@@ -147,6 +150,8 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(schema, /status: text\("status", \{ enum: \["running", "completed", "failed"\]/);
   assert.match(css, /overflow-wrap:anywhere/);
   assert.match(css, /button-feedback/);
+  assert.match(css, /body\{font-size:16px;line-height:1\.65\}/);
+  assert.match(css, /match-category-tabs button\.active\{background:var\(--ink\);color:white/);
   assert.doesNotMatch(page, /await refreshDashboard\(\);\s*setHiddenReasonMatch/);
   assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, cycles, poolRows\] = await Promise\.all/);
   assert.match(worker, /mutual: ownDecision === "interested"/);

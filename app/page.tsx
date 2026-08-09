@@ -140,10 +140,11 @@ export default function Home() {
   const fields = mode === "role" ? roleFields : talentFields;
   const completion = useMemo(() => Math.round(fields.filter(f => values[`${mode}-${f.key}`]?.trim()).length / fields.length * 100), [fields, mode, values]);
   const unreadCount = notifications.filter(item=>!item.readAt).length;
+  const unreadMessageCount = notifications.filter(item=>!item.readAt&&item.type==="new_message").length;
   const activeConversationItem = conversations.find(item=>item.id===activeConversation);
   const draftProfile = (["role","talent"] as Mode[]).find(type=>profileMeta[type]?.status==="draft"||((profileMeta[type]?.completion??100)<100));
   const hasUnreadMessage = notifications.some(item=>!item.readAt&&item.type==="new_message");
-  const effectiveMatchCategory = matchItems.some(item=>item.perspective===matchCategory)?matchCategory:matchCategory==="talent"?"role":"talent";
+  const effectiveMatchCategory = matchCategory;
   const visibleMatchItems = matchItems.filter(item=>item.perspective===effectiveMatchCategory).slice(0,10);
   const jobDirection = profileMeta.talent?.payload.industry||profileMeta.talent?.payload.company||profileMeta.talent?.payload.ability||"目标岗位";
   const dailyCareerTip = useMemo(()=>{
@@ -161,7 +162,7 @@ export default function Home() {
   const activeConversationItemForHome = conversations.find(item=>item.status==="active");
   const primaryHomeState = hasUnreadMessage?"message":pendingSuccessConversation?"confirm":activeConversationItemForHome?"conversation":matchItems.length?"matches":draftProfile?"draft":readyForMatching?"waiting":"start";
   const homeActionCopy = {
-    message:{title:"回复匿名消息",description:`你有 ${unreadCount} 条未读通知。及时回应有助于建立可靠的职业关系。`,label:"去回复"},
+    message:{title:"回复匿名消息",description:`你有 ${unreadMessageCount} 条匿名消息等待回复。及时回应有助于建立可靠的职业关系。`,label:"去匿名沟通"},
     confirm:{title:"处理合作确认",description:"对方正在等待你确认这次沟通是否产生了双方认可的结果。",label:"查看确认"},
     conversation:{title:"继续匿名沟通",description:"你们已经双方互选。先核实岗位、项目和权限，再决定是否交换真实身份。",label:"继续沟通"},
     matches:{title:"判断今天的新机会",description:`两个方向共有 ${matchItems.length} 条结果，其中 ${matchingStats.mutual} 条已经双方互选。`,label:"查看今日匹配"},
@@ -371,7 +372,7 @@ export default function Home() {
     window.setTimeout(()=>button.classList.remove("button-feedback"),650);
   }
   function runHomeAction(){
-    if(primaryHomeState==="message")return nav("notifications");
+    if(primaryHomeState==="message")return nav("messages");
     if(primaryHomeState==="confirm"&&pendingSuccessConversation)return void openConversation(pendingSuccessConversation.id);
     if(primaryHomeState==="conversation"&&activeConversationItemForHome)return void openConversation(activeConversationItemForHome.id);
     if(primaryHomeState==="matches"||primaryHomeState==="waiting")return nav("matches");
