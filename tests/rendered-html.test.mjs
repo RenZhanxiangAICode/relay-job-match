@@ -57,6 +57,7 @@ test("keeps real email auth and persistent profiles wired", async () => {
   assert.match(worker, /ADMIN_EMAILS/);
   assert.match(worker, /\u65e0\u7ba1\u7406\u5458\u6743\u9650/);
   assert.equal(JSON.parse(hosting).d1, "DB");
+  assert.equal(JSON.parse(hosting).r2, "EVIDENCE");
   assert.match(envExample, /RESEND_API_KEY=/);
   assert.match(envExample, /AUTH_SECRET=/);
   assert.match(envExample, /GOOGLE_CLIENT_ID=/);
@@ -126,6 +127,12 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(page, /已发出意向/);
   assert.match(page, /双方已经互选/);
   assert.match(page, /对应机会/);
+  assert.doesNotMatch(page, /chat-match-context" open/);
+  assert.doesNotMatch(page, />✓ 邮箱已验证</);
+  assert.match(page, /举报这位匿名用户/);
+  assert.match(page, /证据截图（1—3 张）/);
+  assert.match(page, /评价本次合作/);
+  assert.match(page, /activeConversationItem\.status==="successful"/);
   assert.match(page, /正在进入匿名沟通/);
   assert.match(page, /DASHBOARD_CACHE_KEY/);
   assert.match(page, /sessionStorage/);
@@ -164,6 +171,11 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(worker, /\/api\/admin\/database/);
   assert.match(worker, /generativelanguage\.googleapis\.com/);
   assert.match(worker, /responseJsonSchema/);
+  assert.match(worker, /async function reportsApi/);
+  assert.match(worker, /env\.EVIDENCE\.put/);
+  assert.match(worker, /async function conversationReviewApi/);
+  assert.match(worker, /\/api\/reports/);
+  assert.match(worker, /\/reviews/);
   assert.match(worker, /ai_parse_usage/);
   assert.doesNotMatch(page, /split\(\/\[\\n，。；/);
 });

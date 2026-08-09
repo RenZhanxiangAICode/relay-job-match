@@ -4,6 +4,7 @@ import handler from "vinext/server/app-router-entry";
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  EVIDENCE?: R2Bucket;
   RESEND_API_KEY?: string;
   EMAIL_FROM?: string;
   AUTH_SECRET?: string;
@@ -833,14 +834,15 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
       m.score, rp.user_id AS roleUserId, rp.payload AS rolePayload, tp.payload AS talentPayload,
       m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
       (SELECT body FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastMessage,
-      (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount
+      (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) AS messageCount,
+      EXISTS(SELECT 1 FROM reviews r WHERE r.conversation_id = c.id AND r.reviewer_id = ?) AS reviewedByMe
     FROM conversations c
     JOIN matches m ON m.id = c.match_id
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
     WHERE rp.user_id = ? OR tp.user_id = ?
     ORDER BY c.created_at DESC
-  `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
+  `).bind(auth.user.id, auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
 
   const historyRowsPromise = env.DB.prepare(`
     SELECT m.id, m.week_key AS weekKey, m.score, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
@@ -900,7 +902,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     const perspective = row.roleUserId === auth.user.id ? "role" : "talent";
     return {
       id: row.id, matchId: row.matchId, status: row.status, createdAt: row.createdAt, anonymousCode: row.anonymousCode, score: row.score,
-      lastMessage: row.lastMessage, messageCount: row.messageCount, perspective,
+      lastMessage: row.lastMessage, messageCount: row.messageCount, reviewedByMe: Boolean(Number(row.reviewedByMe)), perspective,
       payload: JSON.parse(String(perspective === "role" ? row.talentPayload : row.rolePayload)),
       reasons: JSON.parse(String(row.reasons)), risks: JSON.parse(String(row.risks)), verifyOnMeeting: JSON.parse(String(row.verifyOnMeeting)),
     };
@@ -1033,11 +1035,12 @@ async function conversationContext(env: Env, conversationId: string, userId: str
       CASE WHEN rp.user_id = ? THEN tp.user_id ELSE rp.user_id END AS otherUserId,
       CASE WHEN rp.user_id = ? THEN tp.anonymous_code ELSE rp.anonymous_code END AS anonymousCode,
       CASE WHEN rp.user_id = ? THEN tp.payload ELSE rp.payload END AS opposingPayload,
-      m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting
+      m.reasons, m.risks, m.verify_on_meeting AS verifyOnMeeting,
+      EXISTS(SELECT 1 FROM reviews r WHERE r.conversation_id = c.id AND r.reviewer_id = ?) AS reviewedByMe
     FROM conversations c JOIN matches m ON m.id = c.match_id
     JOIN profiles rp ON rp.id = m.role_profile_id JOIN profiles tp ON tp.id = m.talent_profile_id
     WHERE c.id = ? AND (rp.user_id = ? OR tp.user_id = ?)
-  `).bind(userId, userId, userId, conversationId, userId, userId).first<Record<string, string | number | null>>();
+  `).bind(userId, userId, userId, userId, conversationId, userId, userId).first<Record<string, string | number | null>>();
 }
 
 async function conversationMessagesApi(request: Request, env: Env, conversationId: string) {
@@ -1048,7 +1051,7 @@ async function conversationMessagesApi(request: Request, env: Env, conversationI
   if (request.method === "GET") {
     const rows = await env.DB.prepare(`SELECT id, sender_id AS senderId, body, created_at AS createdAt FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500`)
       .bind(conversationId).all<Record<string, string | number>>();
-    return json({ conversation: { id: conversationId, matchId: context.matchId, status: context.status, createdAt: context.createdAt, anonymousCode: context.anonymousCode, score: context.score, perspective: context.roleUserId === auth.user.id ? "role" : "talent", payload: JSON.parse(String(context.opposingPayload)), reasons: JSON.parse(String(context.reasons)), risks: JSON.parse(String(context.risks)), verifyOnMeeting: JSON.parse(String(context.verifyOnMeeting)), successRequestedByMe: context.successRequestedBy === auth.user.id, messageCount: rows.results.length }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
+    return json({ conversation: { id: conversationId, matchId: context.matchId, status: context.status, createdAt: context.createdAt, anonymousCode: context.anonymousCode, score: context.score, perspective: context.roleUserId === auth.user.id ? "role" : "talent", payload: JSON.parse(String(context.opposingPayload)), reasons: JSON.parse(String(context.reasons)), risks: JSON.parse(String(context.risks)), verifyOnMeeting: JSON.parse(String(context.verifyOnMeeting)), successRequestedByMe: context.successRequestedBy === auth.user.id, reviewedByMe: Boolean(Number(context.reviewedByMe)), messageCount: rows.results.length }, messages: rows.results.map((row) => ({ ...row, mine: row.senderId === auth.user!.id })) });
   }
   if (request.method !== "POST") return json({ error: "不支持的请求" }, 405);
   if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
@@ -1092,6 +1095,89 @@ async function conversationActionApi(request: Request, env: Env, conversationId:
     return json({ ok: true, status: "success_pending" });
   }
   return json({ error: "操作无效" }, 400);
+}
+
+async function conversationReviewApi(request: Request, env: Env, conversationId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  const context = await conversationContext(env, conversationId, auth.user.id);
+  if (!context) return json({ error: "会话不存在" }, 404);
+  if (context.status !== "successful") return json({ error: "只有双方确认合作成功后才能评价" }, 409);
+  const existing = await env.DB.prepare("SELECT id FROM reviews WHERE conversation_id = ? AND reviewer_id = ?").bind(conversationId, auth.user.id).first();
+  if (existing) return json({ error: "你已经评价过本次合作" }, 409);
+  const body = await requestBody(request);
+  const limits = { truthfulness: 25, attitude: 20, responsiveness: 15, professionalism: 20, fulfillment: 20 } as const;
+  const scores = Object.fromEntries(Object.keys(limits).map((key) => [key, Number(body?.[key])])) as Record<keyof typeof limits, number>;
+  if (Object.entries(limits).some(([key, max]) => !Number.isInteger(scores[key as keyof typeof limits]) || scores[key as keyof typeof limits] < 0 || scores[key as keyof typeof limits] > max)) return json({ error: "评价分数无效" }, 400);
+  const comment = typeof body?.comment === "string" ? body.comment.trim().slice(0, 800) : "";
+  const total = Object.values(scores).reduce((sum, value) => sum + value, 0);
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO reviews (id, conversation_id, reviewer_id, truthfulness, attitude, responsiveness, professionalism, fulfillment, comment, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(crypto.randomUUID(), conversationId, auth.user.id, scores.truthfulness, scores.attitude, scores.responsiveness, scores.professionalism, scores.fulfillment, comment, now).run();
+  if (total > 90) {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE users SET reputation = MIN(100, reputation + 1), updated_at = ? WHERE id = ?").bind(now, context.otherUserId),
+      env.DB.prepare("INSERT INTO reputation_events (id, user_id, reason, delta, evidence_ref, created_at) VALUES (?, ?, 'positive_review', 1, ?, ?)").bind(crypto.randomUUID(), context.otherUserId, conversationId, now),
+    ]);
+    await createNotification(env, { userId: String(context.otherUserId), type: "reputation", title: "收到高质量合作评价", body: "本次评价高于 90 分，你的信誉增加 1 分。", targetId: conversationId, dedupeKey: `positive-review:${conversationId}:${context.otherUserId}` });
+  } else if (total < 60) {
+    await createNotification(env, { userId: String(context.otherUserId), type: "reputation", title: "收到一次低分合作评价", body: "首次低分只作提醒，不立即扣分；如认为评价不实，可以申诉。", targetId: conversationId, dedupeKey: `low-review-warning:${conversationId}:${context.otherUserId}` });
+  }
+  const reviewCount = await env.DB.prepare("SELECT COUNT(*) AS count FROM reviews WHERE conversation_id = ?").bind(conversationId).first<{ count: number }>();
+  const rewarded = await env.DB.prepare("SELECT 1 AS found FROM reputation_events WHERE reason = 'successful_match' AND evidence_ref = ? LIMIT 1").bind(conversationId).first();
+  if ((reviewCount?.count ?? 0) >= 2 && !rewarded) {
+    const roleUserId = String(context.roleUserId); const talentUserId = String(context.talentUserId);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE users SET reputation = MIN(100, reputation + 3), updated_at = ? WHERE id IN (?, ?)").bind(now, roleUserId, talentUserId),
+      env.DB.prepare("INSERT INTO reputation_events (id, user_id, reason, delta, evidence_ref, created_at) VALUES (?, ?, 'successful_match', 3, ?, ?)").bind(crypto.randomUUID(), roleUserId, conversationId, now),
+      env.DB.prepare("INSERT INTO reputation_events (id, user_id, reason, delta, evidence_ref, created_at) VALUES (?, ?, 'successful_match', 3, ?, ?)").bind(crypto.randomUUID(), talentUserId, conversationId, now),
+    ]);
+  }
+  return json({ ok: true, total, reviewedByMe: true });
+}
+
+async function reportsApi(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  if (!assertSameOrigin(request)) return json({ error: "请求来源无效" }, 403);
+  if (!env.EVIDENCE) return json({ error: "证据存储暂未配置，请联系管理员" }, 503);
+  const form = await request.formData();
+  const conversationId = String(form.get("conversationId") ?? "");
+  const category = String(form.get("category") ?? "");
+  const summary = String(form.get("summary") ?? "").trim().slice(0, 1200);
+  const categories = new Set(["false_job", "false_resume", "fraud", "harassment", "other"]);
+  const context = await conversationContext(env, conversationId, auth.user.id);
+  if (!context) return json({ error: "会话不存在" }, 404);
+  if (!categories.has(category) || summary.length < 10) return json({ error: "请选择举报理由，并至少填写 10 个字的情况说明" }, 400);
+  const files = form.getAll("evidence").filter((item): item is File => item instanceof File && item.size > 0);
+  if (files.length < 1 || files.length > 3) return json({ error: "请上传 1—3 张证据截图" }, 400);
+  const allowed = new Map([["image/png", "png"], ["image/jpeg", "jpg"], ["image/webp", "webp"]]);
+  if (files.some((file) => !allowed.has(file.type) || file.size > 5 * 1024 * 1024)) return json({ error: "证据仅支持 PNG、JPG、WebP，且每张不超过 5MB" }, 400);
+  const reportId = crypto.randomUUID(); const stored: string[] = [];
+  try {
+    for (const file of files) {
+      const key = `reports/${reportId}/${crypto.randomUUID()}.${allowed.get(file.type)}`;
+      await env.EVIDENCE.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type }, customMetadata: { reportId, uploadedBy: auth.user.id } });
+      stored.push(key);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare("INSERT INTO reports (id, reporter_id, reported_user_id, category, summary, evidence, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'jury', ?)")
+      .bind(reportId, auth.user.id, context.otherUserId, category, summary, JSON.stringify(stored), now).run();
+    const jurors = await env.DB.prepare("SELECT id FROM users WHERE reputation = 100 AND status = 'active' AND id NOT IN (?, ?) ORDER BY RANDOM() LIMIT 11")
+      .bind(auth.user.id, context.otherUserId).all<{ id: string }>();
+    if (jurors.results.length) await env.DB.batch(jurors.results.map((juror) => env.DB.prepare("INSERT INTO jury_assignments (report_id, juror_id, assigned_at, expires_at) VALUES (?, ?, ?, ?)").bind(reportId, juror.id, now, now + 3 * 86400)));
+    await Promise.all([
+      createNotification(env, { userId: String(context.otherUserId), type: "report", title: "收到一项匿名举报", body: "举报已进入脱敏陪审流程；如最终成立，你可以申诉。", targetId: reportId, dedupeKey: `report-received:${reportId}` }),
+      ...jurors.results.map((juror) => createNotification(env, { userId: juror.id, type: "jury", title: "收到新的陪审案件", body: "请在 3 天内查看脱敏证据并投票，也可以选择弃权。", targetId: reportId, dedupeKey: `jury-assigned:${reportId}:${juror.id}` })),
+    ]);
+    return json({ ok: true, reportId });
+  } catch (error) {
+    await Promise.all(stored.map((key) => env.EVIDENCE!.delete(key)));
+    console.error("report submission failed", error);
+    return json({ error: "举报提交失败，请稍后重试" }, 500);
+  }
 }
 
 async function notificationsApi(request: Request, env: Env, notificationId: string) {
@@ -1242,6 +1328,9 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (conversationMessagesMatch && (request.method === "GET" || request.method === "POST")) return conversationMessagesApi(request, env, conversationMessagesMatch[1]);
   const conversationActionMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/action$/);
   if (conversationActionMatch && request.method === "POST") return conversationActionApi(request, env, conversationActionMatch[1]);
+  const conversationReviewMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/reviews$/);
+  if (conversationReviewMatch && request.method === "POST") return conversationReviewApi(request, env, conversationReviewMatch[1]);
+  if (pathname === "/api/reports" && request.method === "POST") return reportsApi(request, env);
   const notificationMatch = pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
   if (notificationMatch && request.method === "PUT") return notificationsApi(request, env, notificationMatch[1]);
   if (pathname === "/api/admin/summary" && request.method === "GET") return adminSummaryApi(request, env);
