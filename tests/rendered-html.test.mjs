@@ -83,7 +83,7 @@ test("supports Google OAuth while keeping email verification", async () => {
   assert.match(schema, /oauthIdentities/);
 });
 
-test("uses indexed incremental matching and per-direction monthly limits", async () => {
+test("uses indexed incremental matching with freely managed per-direction posts", async () => {
   const [worker, schema, page, css] = await Promise.all([
     readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
     readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
@@ -106,7 +106,10 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(schema, /matchFeedback/);
   assert.match(schema, /adminMatchRefreshes/);
   assert.match(page, /暂停入池/);
-  assert.match(page, /本月已删除过/);
+  assert.match(page, /可以随时删除和重新发布/);
+  assert.match(page, /删除后可以随时重新发布/);
+  assert.doesNotMatch(worker, /本月已经删除过/);
+  assert.doesNotMatch(worker, /本月已经重新创建过/);
   assert.match(page, /互选记录/);
   assert.match(page, /双方都点击“想了解”后长期保留/);
   assert.match(page, /进入聊天/);
@@ -162,7 +165,7 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(css, /--type-hero:clamp\(42px/);
   assert.match(css, /match-category-tabs button\.active\{background:var\(--ink\);color:white/);
   assert.doesNotMatch(page, /await refreshDashboard\(\);\s*setHiddenReasonMatch/);
-  assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, cycles, poolRows\] = await Promise\.all/);
+  assert.match(worker, /const \[matchRows, notificationRows, conversations, historyRows, poolRows\] = await Promise\.all/);
   assert.match(worker, /mutual: ownDecision === "interested"/);
   assert.match(worker, /opposingPayload/);
   assert.match(worker, /user: \{ email: auth\.user\.email, reputation: auth\.user\.reputation/);
@@ -174,6 +177,10 @@ test("uses indexed incremental matching and per-direction monthly limits", async
   assert.match(worker, /async function reportsApi/);
   assert.match(worker, /env\.EVIDENCE\.put/);
   assert.match(worker, /async function conversationReviewApi/);
+  assert.match(worker, /async function conversationPeerApi/);
+  assert.match(worker, /\/peer/);
+  assert.match(page, /查看对方资料与评价/);
+  assert.match(page, /暂无合作评价/);
   assert.match(worker, /\/api\/reports/);
   assert.match(worker, /\/reviews/);
   assert.match(worker, /ai_parse_usage/);

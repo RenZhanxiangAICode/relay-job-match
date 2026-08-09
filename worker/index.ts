@@ -68,10 +68,6 @@ function matchCycleKey(date = new Date()) {
   }).format(date);
 }
 
-function monthKey(date = new Date()) {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
-}
-
 function tokenize(value: unknown) {
   const text = String(value ?? "").toLowerCase().normalize("NFKC");
   const tokens = text.match(/[a-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}/g) ?? [];
@@ -716,16 +712,6 @@ async function profilesApi(request: Request, env: Env) {
   const current = await env.DB.prepare("SELECT id, anonymous_code AS anonymousCode, status, content_version AS contentVersion FROM profiles WHERE user_id = ? AND type = ?")
     .bind(auth.user.id, type).first<{ id: string; anonymousCode: string; status: string; contentVersion: number }>();
   const recreating = current?.status === "removed";
-  if (recreating) {
-    const cycle = await env.DB.prepare("SELECT recreate_count AS recreateCount FROM publication_cycles WHERE user_id = ? AND type = ? AND month_key = ?")
-      .bind(auth.user.id, type, monthKey()).first<{ recreateCount: number }>();
-    if ((cycle?.recreateCount ?? 0) >= 1) return json({ error: "该方向本月的重新新建次数已用完" }, 429);
-    await env.DB.prepare(`
-      INSERT INTO publication_cycles (user_id, type, month_key, delete_count, recreate_count)
-      VALUES (?, ?, ?, 0, 1)
-      ON CONFLICT(user_id, type, month_key) DO UPDATE SET recreate_count = recreate_count + 1
-    `).bind(auth.user.id, type, monthKey()).run();
-  }
   const id = current?.id ?? crypto.randomUUID();
   const prefix = type === "role" ? "R" : "T";
   const anonymousCode = !current || recreating ? `${prefix}-${String(Math.floor(Math.random() * 900000) + 100000)}` : current.anonymousCode;
@@ -763,17 +749,9 @@ async function profileLifecycleApi(request: Request, env: Env, type: "role" | "t
   if (!profile || profile.status === "removed") return json({ error: "发布不存在" }, 404);
   const now = Math.floor(Date.now() / 1000);
   if (request.method === "DELETE") {
-    const cycle = await env.DB.prepare("SELECT delete_count AS deleteCount FROM publication_cycles WHERE user_id = ? AND type = ? AND month_key = ?")
-      .bind(auth.user.id, type, monthKey()).first<{ deleteCount: number }>();
-    if ((cycle?.deleteCount ?? 0) >= 1) return json({ error: "该方向本月的删除次数已用完" }, 429);
     await env.DB.batch([
       env.DB.prepare("UPDATE profiles SET status = 'removed', deleted_at = ?, updated_at = ? WHERE id = ?").bind(now, now, profile.id),
       env.DB.prepare("DELETE FROM profile_keywords WHERE profile_id = ?").bind(profile.id),
-      env.DB.prepare(`
-        INSERT INTO publication_cycles (user_id, type, month_key, delete_count, recreate_count)
-        VALUES (?, ?, ?, 1, 0)
-        ON CONFLICT(user_id, type, month_key) DO UPDATE SET delete_count = delete_count + 1
-      `).bind(auth.user.id, type, monthKey()),
     ]);
     return json({ ok: true, status: "removed" });
   }
@@ -848,7 +826,8 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     SELECT m.id, m.week_key AS weekKey, m.score, m.role_decision AS roleDecision, m.talent_decision AS talentDecision,
       rp.user_id AS roleUserId, rp.anonymous_code AS roleCode,
       tp.user_id AS talentUserId, tp.anonymous_code AS talentCode,
-      c.id AS conversationId, c.status AS conversationStatus
+      c.id AS conversationId, c.status AS conversationStatus,
+      EXISTS(SELECT 1 FROM reviews r WHERE r.conversation_id = c.id AND r.reviewer_id = ?) AS reviewedByMe
     FROM matches m
     JOIN profiles rp ON rp.id = m.role_profile_id
     JOIN profiles tp ON tp.id = m.talent_profile_id
@@ -856,12 +835,7 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     WHERE (rp.user_id = ? OR tp.user_id = ?)
       AND m.role_decision = 'interested' AND m.talent_decision = 'interested'
     ORDER BY c.created_at DESC
-  `).bind(auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
-
-  const cyclesPromise = env.DB.prepare(`
-    SELECT type, delete_count AS deleteCount, recreate_count AS recreateCount
-    FROM publication_cycles WHERE user_id = ? AND month_key = ?
-  `).bind(auth.user.id, monthKey()).all<{ type: "role" | "talent"; deleteCount: number; recreateCount: number }>();
+  `).bind(auth.user.id, auth.user.id, auth.user.id).all<Record<string, string | number | null>>();
 
   const poolStatsPromise = env.DB.prepare(`
     SELECT type, COUNT(*) AS count FROM profiles
@@ -869,8 +843,8 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     GROUP BY type
   `).bind(auth.user.id).all<{ type: "role" | "talent"; count: number }>();
 
-  const [matchRows, notificationRows, conversations, historyRows, cycles, poolRows] = await Promise.all([
-    matchRowsPromise, notificationRowsPromise, conversationsPromise, historyRowsPromise, cyclesPromise, poolStatsPromise,
+  const [matchRows, notificationRows, conversations, historyRows, poolRows] = await Promise.all([
+    matchRowsPromise, notificationRowsPromise, conversationsPromise, historyRowsPromise, poolStatsPromise,
   ]);
 
   const allMatches = matchRows.results.map((row) => {
@@ -912,24 +886,18 @@ async function dashboardApi(request: Request, env: Env, ctx: ExecutionContext) {
     return {
       id: row.id, weekKey: row.weekKey, score: row.score, outcome: "success",
       anonymousCode: isRole ? row.talentCode : row.roleCode,
-      perspective: isRole ? "role" : "talent", reviewAvailable: true,
+      perspective: isRole ? "role" : "talent",
+      reviewAvailable: row.conversationStatus === "successful" && !Boolean(Number(row.reviewedByMe)),
       conversationId: row.conversationId, conversationStatus: row.conversationStatus,
     };
   });
 
-  const publicationLimits = {
-    role: { canDelete: true, canRecreate: true },
-    talent: { canDelete: true, canRecreate: true },
-  };
-  for (const cycle of cycles.results) {
-    publicationLimits[cycle.type] = { canDelete: cycle.deleteCount < 1, canRecreate: cycle.recreateCount < 1 };
-  }
   const poolStats = { role: 0, talent: 0 };
   for (const row of poolRows.results) poolStats[row.type] = Number(row.count);
 
   return json({
     user: { email: auth.user.email, reputation: auth.user.reputation, isAdmin: isAdmin(env, auth.user.email) },
-    profiles: profileRows, publicationLimits, readyForMatching, matchingPending, matches, history, notifications: notificationRows.results, conversations: conversationItems, poolStats,
+    profiles: profileRows, readyForMatching, matchingPending, matches, history, notifications: notificationRows.results, conversations: conversationItems, poolStats,
     matchingStats: {
       role: matches.filter((match) => match.perspective === "role").length,
       talent: matches.filter((match) => match.perspective === "talent").length,
@@ -1138,6 +1106,64 @@ async function conversationReviewApi(request: Request, env: Env, conversationId:
   return json({ ok: true, total, reviewedByMe: true });
 }
 
+async function conversationPeerApi(request: Request, env: Env, conversationId: string) {
+  const auth = await requireUser(request, env);
+  if (auth.response || !auth.user) return auth.response!;
+  const context = await conversationContext(env, conversationId, auth.user.id);
+  if (!context) return json({ error: "会话不存在" }, 404);
+
+  const peer = await env.DB.prepare("SELECT reputation, created_at AS createdAt FROM users WHERE id = ?")
+    .bind(context.otherUserId).first<{ reputation: number; createdAt: number }>();
+  if (!peer) return json({ error: "对方账号不存在" }, 404);
+
+  const reviewRows = await env.DB.prepare(`
+    SELECT r.id, r.truthfulness, r.attitude, r.responsiveness, r.professionalism,
+      r.fulfillment, r.comment, r.created_at AS createdAt
+    FROM reviews r
+    JOIN conversations c ON c.id = r.conversation_id
+    JOIN matches m ON m.id = c.match_id
+    JOIN profiles rp ON rp.id = m.role_profile_id
+    JOIN profiles tp ON tp.id = m.talent_profile_id
+    WHERE (r.reviewer_id = rp.user_id AND tp.user_id = ?)
+       OR (r.reviewer_id = tp.user_id AND rp.user_id = ?)
+    ORDER BY r.created_at DESC LIMIT 100
+  `).bind(context.otherUserId, context.otherUserId).all<{
+    id: string; truthfulness: number; attitude: number; responsiveness: number;
+    professionalism: number; fulfillment: number; comment: string; createdAt: number;
+  }>();
+  const reviews = reviewRows.results.map((review) => ({
+    ...review,
+    total: review.truthfulness + review.attitude + review.responsiveness + review.professionalism + review.fulfillment,
+  }));
+  const average = (key: "total" | "truthfulness" | "attitude" | "responsiveness" | "professionalism" | "fulfillment") =>
+    reviews.length ? Math.round(reviews.reduce((sum, review) => sum + review[key], 0) / reviews.length) : 0;
+  let rawPayload: Record<string, unknown> = {};
+  try { rawPayload = JSON.parse(String(context.opposingPayload)); } catch { rawPayload = {}; }
+  const publicFields = ["role", "city", "industry", "experience", "education", "ability", "projects"];
+  const payload = Object.fromEntries(publicFields.flatMap((key) => {
+    const value = String(rawPayload[key] ?? "").trim();
+    return value ? [[key, value]] : [];
+  }));
+
+  return json({ profile: {
+    anonymousCode: context.anonymousCode,
+    perspective: context.roleUserId === auth.user.id ? "talent" : "role",
+    reputation: peer.reputation,
+    memberSince: peer.createdAt,
+    payload,
+    summary: {
+      count: reviews.length,
+      average: average("total"),
+      truthfulness: average("truthfulness"),
+      attitude: average("attitude"),
+      responsiveness: average("responsiveness"),
+      professionalism: average("professionalism"),
+      fulfillment: average("fulfillment"),
+    },
+    reviews,
+  } });
+}
+
 async function reportsApi(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (auth.response || !auth.user) return auth.response!;
@@ -1330,6 +1356,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext) {
   if (conversationActionMatch && request.method === "POST") return conversationActionApi(request, env, conversationActionMatch[1]);
   const conversationReviewMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/reviews$/);
   if (conversationReviewMatch && request.method === "POST") return conversationReviewApi(request, env, conversationReviewMatch[1]);
+  const conversationPeerMatch = pathname.match(/^\/api\/conversations\/([^/]+)\/peer$/);
+  if (conversationPeerMatch && request.method === "GET") return conversationPeerApi(request, env, conversationPeerMatch[1]);
   if (pathname === "/api/reports" && request.method === "POST") return reportsApi(request, env);
   const notificationMatch = pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
   if (notificationMatch && request.method === "PUT") return notificationsApi(request, env, notificationMatch[1]);
