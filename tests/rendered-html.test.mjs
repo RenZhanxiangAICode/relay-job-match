@@ -106,7 +106,7 @@ test("uses indexed incremental matching with freely managed per-direction posts"
   assert.match(schema, /matchFeedback/);
   assert.match(schema, /adminMatchRefreshes/);
   assert.match(page, /暂停入池/);
-  assert.match(page, /可以随时删除和重新发布/);
+  assert.doesNotMatch(page, /两个方向分别管理/);
   assert.match(page, /删除后可以随时重新发布/);
   assert.doesNotMatch(worker, /本月已经删除过/);
   assert.doesNotMatch(worker, /本月已经重新创建过/);
