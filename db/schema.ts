@@ -5,7 +5,9 @@ export const users = sqliteTable("users", {
   email: text("email").notNull(),
   emailVerifiedAt: integer("email_verified_at", { mode: "timestamp" }),
   reputation: integer("reputation").notNull().default(80),
-  status: text("status", { enum: ["active", "suspended", "banned"] }).notNull().default("active"),
+  status: text("status", { enum: ["active", "suspended", "deleting"] }).notNull().default("active"),
+  juryEligible: integer("jury_eligible", { mode: "boolean" }).notNull().default(true),
+  juryPermanentlyRevoked: integer("jury_permanently_revoked", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("users_email_unique").on(table.email)]);
@@ -16,7 +18,17 @@ export const emailVerificationCodes = sqliteTable("email_verification_codes", {
   expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
   attempts: integer("attempts").notNull().default(0),
   sentAt: integer("sent_at", { mode: "timestamp" }).notNull(),
+  deliveryId: text("delivery_id"),
+  deliveryTokenHash: text("delivery_token_hash"),
 });
+
+export const authRateLimits = sqliteTable("auth_rate_limits", {
+  scope: text("scope").notNull(),
+  keyHash: text("key_hash").notNull(),
+  windowKey: text("window_key").notNull(),
+  requestCount: integer("request_count").notNull().default(0),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+}, (table) => [primaryKey({ columns: [table.scope, table.keyHash, table.windowKey] })]);
 
 export const sessions = sqliteTable("sessions", {
   tokenHash: text("token_hash").primaryKey(),
@@ -146,8 +158,11 @@ export const adminMatchRefreshes = sqliteTable("admin_match_refreshes", {
 export const conversations = sqliteTable("conversations", {
   id: text("id").primaryKey(),
   matchId: text("match_id").notNull().references(() => matches.id, { onDelete: "cascade" }),
-  status: text("status", { enum: ["active", "cancelled", "success_pending", "successful"] }).notNull().default("active"),
+  status: text("status", { enum: ["active", "cancelled", "success_pending", "successful", "frozen"] }).notNull().default("active"),
   successRequestedBy: text("success_requested_by").references(() => users.id),
+  outcomeStage: text("outcome_stage", { enum: ["chatting", "interview", "referral", "offer", "hired", "handover"] }).notNull().default("chatting"),
+  outcomeRequestedStage: text("outcome_requested_stage", { enum: ["interview", "referral", "offer", "hired", "handover"] }),
+  outcomeRequestedBy: text("outcome_requested_by").references(() => users.id),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("conversations_match_unique").on(table.matchId)]);
@@ -186,17 +201,23 @@ export const reviews = sqliteTable("reviews", {
   fulfillment: integer("fulfillment").notNull(),
   comment: text("comment").notNull().default(""),
   followup: text("followup"),
+  response: text("response"),
+  status: text("status", { enum: ["pending", "published", "disputed", "removed"] }).notNull().default("pending"),
+  publishAt: integer("publish_at", { mode: "timestamp" }).notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("reviews_conversation_reviewer_unique").on(table.conversationId, table.reviewerId)]);
 
 export const reputationEvents = sqliteTable("reputation_events", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  reason: text("reason", { enum: ["successful_match", "positive_review", "false_profile", "fraud", "malicious_report", "malicious_jury", "appeal_correction"] }).notNull(),
+  reason: text("reason", { enum: ["successful_match", "positive_review", "negative_review", "false_profile", "fraud", "harassment", "malicious_report", "malicious_jury", "appeal_correction"] }).notNull(),
   delta: integer("delta").notNull(),
   evidenceRef: text("evidence_ref"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-}, (table) => [index("reputation_user_time_idx").on(table.userId, table.createdAt)]);
+}, (table) => [
+  index("reputation_user_time_idx").on(table.userId, table.createdAt),
+  uniqueIndex("reputation_event_once_unique").on(table.userId, table.reason, table.evidenceRef),
+]);
 
 export const reports = sqliteTable("reports", {
   id: text("id").primaryKey(),
@@ -205,7 +226,12 @@ export const reports = sqliteTable("reports", {
   category: text("category", { enum: ["false_job", "false_resume", "fraud", "harassment", "other"] }).notNull(),
   summary: text("summary").notNull(),
   evidence: text("evidence", { mode: "json" }).$type<string[]>().notNull(),
-  status: text("status", { enum: ["jury", "banned", "dismissed", "appealed", "closed"] }).notNull().default("jury"),
+  status: text("status", { enum: ["submitted", "processing", "jury", "insufficient", "substantiated", "dismissed", "appealed", "upheld", "reversed", "closed"] }).notNull().default("jury"),
+  conversationId: text("conversation_id").references(() => conversations.id),
+  evidenceStatus: text("evidence_status", { enum: ["user_redacted", "processed", "failed"] }).notNull().default("user_redacted"),
+  round: integer("round").notNull().default(1),
+  validVotes: integer("valid_votes").notNull().default(0),
+  resolvedAt: integer("resolved_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [index("reports_status_idx").on(table.status, table.createdAt)]);
 
@@ -214,6 +240,8 @@ export const juryAssignments = sqliteTable("jury_assignments", {
   jurorId: text("juror_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   assignedAt: integer("assigned_at", { mode: "timestamp" }).notNull(),
   expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+  round: integer("round").notNull().default(1),
+  status: text("status", { enum: ["assigned", "voted", "abstained", "expired"] }).notNull().default("assigned"),
 }, (table) => [
   primaryKey({ columns: [table.reportId, table.jurorId] }),
   index("jury_assignments_juror_idx").on(table.jurorId, table.expiresAt),
@@ -222,7 +250,7 @@ export const juryAssignments = sqliteTable("jury_assignments", {
 export const juryVotes = sqliteTable("jury_votes", {
   reportId: text("report_id").notNull().references(() => reports.id, { onDelete: "cascade" }),
   jurorId: text("juror_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  verdict: text("verdict", { enum: ["ban", "keep"] }).notNull(),
+  verdict: text("verdict", { enum: ["substantiated", "unsubstantiated", "insufficient", "abstain"] }).notNull(),
   votedAt: integer("voted_at", { mode: "timestamp" }).notNull(),
   upheldAfterAppeal: integer("upheld_after_appeal", { mode: "boolean" }),
 }, (table) => [primaryKey({ columns: [table.reportId, table.jurorId] })]);
@@ -237,3 +265,43 @@ export const appeals = sqliteTable("appeals", {
   reviewedAt: integer("reviewed_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 }, (table) => [uniqueIndex("appeals_report_unique").on(table.reportId)]);
+
+export const dataRequests = sqliteTable("data_requests", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  type: text("type", { enum: ["export", "delete"] }).notNull(),
+  status: text("status", { enum: ["pending", "ready", "cancelled", "completed"] }).notNull().default("pending"),
+  executeAt: integer("execute_at", { mode: "timestamp" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  completedAt: integer("completed_at", { mode: "timestamp" }),
+}, (table) => [index("data_requests_user_time_idx").on(table.userId, table.createdAt)]);
+
+export const productEvents = sqliteTable("product_events", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+  event: text("event").notNull(),
+  targetId: text("target_id"),
+  metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>().notNull().default("{}"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [index("product_events_event_time_idx").on(table.event, table.createdAt)]);
+
+export const adminAuditLogs = sqliteTable("admin_audit_logs", {
+  id: text("id").primaryKey(),
+  adminId: text("admin_id").notNull().references(() => users.id),
+  action: text("action").notNull(),
+  targetType: text("target_type").notNull(),
+  targetId: text("target_id"),
+  detail: text("detail", { mode: "json" }).$type<Record<string, unknown>>().notNull().default("{}"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+}, (table) => [index("admin_audit_time_idx").on(table.createdAt)]);
+
+export const companyComplaints = sqliteTable("company_complaints", {
+  id: text("id").primaryKey(),
+  companyEmail: text("company_email").notNull(),
+  profileCode: text("profile_code").notNull(),
+  reason: text("reason", { enum: ["unauthorized", "closed_hc", "confidential", "impersonation", "other"] }).notNull(),
+  statement: text("statement").notNull(),
+  status: text("status", { enum: ["pending", "verified", "rejected", "resolved"] }).notNull().default("pending"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+}, (table) => [index("company_complaints_status_time_idx").on(table.status, table.createdAt)]);
