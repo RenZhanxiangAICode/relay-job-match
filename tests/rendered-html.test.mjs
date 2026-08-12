@@ -92,10 +92,11 @@ test("uses indexed incremental matching with freely managed per-direction posts"
   ]);
 
   assert.match(worker, /JOIN profile_keywords other ON other\.keyword = mine\.keyword/);
+  assert.match(worker, /bm25\(profile_search\)/);
   assert.match(worker, /LIMIT 100/);
   assert.match(worker, /cosine\(ownVector, candidateVector\)/);
   assert.match(worker, /rankCandidatesWithAi/);
-  assert.match(worker, /gemini-rerank-v2/);
+  assert.match(worker, /bm25-embedding-rules-gemini-v3/);
   assert.match(worker, /recentMatchingFeedback/);
   assert.match(worker, /match_feedback/);
   assert.match(worker, /\/api\/admin\/matches\/refresh/);
@@ -135,7 +136,9 @@ test("uses indexed incremental matching with freely managed per-direction posts"
   assert.match(page, /举报这位匿名用户/);
   assert.match(page, /证据截图（1—3 张）/);
   assert.match(page, /评价本次合作/);
-  assert.match(page, /activeConversationItem\.status==="successful"/);
+  assert.match(page, /outcomeRequestedStage/);
+  assert.match(page, /收到 Offer/);
+  assert.match(page, /请对方确认/);
   assert.match(page, /正在进入匿名沟通/);
   assert.match(page, /DASHBOARD_CACHE_KEY/);
   assert.match(page, /sessionStorage/);
@@ -154,7 +157,9 @@ test("uses indexed incremental matching with freely managed per-direction posts"
   assert.match(worker, /ru\.reputation AS roleReputation, tu\.reputation AS talentReputation/);
   assert.match(page, /setMatchItems\(data\.matches\)/);
   assert.match(page, /两个方向各最多 10 条/);
-  assert.match(worker, /ctx\.waitUntil\(ensureDailyMatchesForUser/);
+  assert.match(worker, /ctx\.waitUntil\(Promise\.all\(\[ensureDailyMatchesForUser/);
+  assert.match(worker, /reassignExpiredJuryCases/);
+  assert.match(worker, /runRetentionMaintenance/);
   assert.match(worker, /\.\.\.allMatches\.filter\(\(match\) => match\.perspective === "role"\)\.slice\(0, 10\)/);
   assert.match(worker, /\.\.\.allMatches\.filter\(\(match\) => match\.perspective === "talent"\)\.slice\(0, 10\)/);
   assert.match(schema, /status: text\("status", \{ enum: \["running", "completed", "failed"\]/);
@@ -204,4 +209,39 @@ test("ships the user-centered onboarding, persistent notifications, and real cha
   assert.match(worker, /转账\|保证金\|培训费/);
   assert.match(schema, /export const notifications/);
   assert.match(schema, /export const reviews/);
+});
+
+test("ships the hardened trust, privacy, jury and semantic matching foundations", async () => {
+  const [page, worker, schema, migration] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0008_spotty_crystal.sql", import.meta.url), "utf8"),
+  ]);
+  assert.match(worker, /gemini-embedding-2:embedContent/);
+  assert.match(worker, /hardCompatibility/);
+  assert.doesNotMatch(worker, /Math\.round\(70 \+ coverage \* 30\)/);
+  assert.match(worker, /request_count = request_count \+ 1/);
+  assert.match(worker, /x-delivery-token/);
+  assert.match(worker, /origin === new URL\(request\.url\)\.origin/);
+  assert.match(worker, /invalid-image-signature/);
+  assert.match(worker, /reencoded-no-metadata/);
+  assert.match(worker, /valid < 5/);
+  assert.match(worker, /counts\.substantiated.*valid \/ 2/);
+  assert.match(worker, /dataExportApi/);
+  assert.match(worker, /accountDeletionApi/);
+  assert.match(worker, /companyComplaintApi/);
+  assert.match(worker, /status = 'frozen'/);
+  assert.match(worker, /content-security-policy/);
+  assert.match(schema, /reputation_event_once_unique/);
+  assert.match(schema, /productEvents/);
+  assert.match(schema, /adminAuditLogs/);
+  assert.match(schema, /companyComplaints/);
+  assert.match(page, /系统暂不自动识别图片中的姓名或联系方式/);
+  assert.match(page, /评价采用双盲机制/);
+  assert.match(page, /你的数据，由你决定/);
+  assert.match(page, /申请注销账号/);
+  assert.doesNotMatch(page, /举报会先脱敏/);
+  assert.match(migration, /jury_eligible/);
+  assert.match(migration, /UPDATE `users` SET `status` = 'active'/);
 });
